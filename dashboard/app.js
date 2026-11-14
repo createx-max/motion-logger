@@ -7,6 +7,7 @@ const STALE_OPEN_MS = 2 * HOUR;
 const ONLINE_MS = 15 * 60000;
 const RANGE_DAYS = 30;
 const STORE_KEY = 'motion-logger-config';
+const THEME_KEY = 'motion-logger-theme';
 
 let sb = null;
 let rows = [];
@@ -222,6 +223,7 @@ function render() {
 
   /* intervals table */
   const shown = inRange.slice(0, 50);
+  const maxDur = Math.max(1, ...shown.map((r) => rowEnd(r, now) - new Date(r.started_at).getTime()));
   $('sessionNote').textContent = inRange.length
     ? `${inRange.length} interval${inRange.length === 1 ? '' : 's'}${inRange.length > shown.length ? ` · showing latest ${shown.length}` : ''}`
     : 'nothing recorded in this period';
@@ -240,7 +242,9 @@ function render() {
             <td>${new Date(s).toLocaleString([], {
               day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit',
             })}</td>
-            <td class="n">${fmtDur(rowEnd(r, now) - s)}</td>
+            <td class="n">${fmtDur(rowEnd(r, now) - s)}<span class="mini" style="width:${Math.round(
+              ((rowEnd(r, now) - s) / maxDur) * 100
+            )}%"></span></td>
             <td>${state}</td>
           </tr>`;
         })
@@ -252,8 +256,20 @@ function render() {
     const b = hourlyBuckets(now).slice().sort((a, x) => x.value - a.value)[0];
     return b && b.value > 0 ? fmtClock(new Date(b.start)) : null;
   })();
+  const busiestDay = (() => {
+    const d = dailyBuckets(now, 14).slice().sort((a, x) => x.value - a.value)[0];
+    return d && d.value > 0 ? new Date(d.start).toLocaleDateString([], { weekday: 'short' }) : null;
+  })();
+
   $('footMeta').textContent = rows.length
-    ? `${rows.length} intervals in the last ${RANGE_DAYS} days${busiest ? ` · busiest hour ${busiest}` : ''}`
+    ? [
+        `${rows.length} intervals in ${RANGE_DAYS} days`,
+        busiest ? `busiest hour ${busiest}` : null,
+        busiestDay ? `busiest day ${busiestDay}` : null,
+        inRange.length ? `avg ${fmtDur(total / inRange.length)}` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ')
     : 'waiting for the first interval';
   $('updated').textContent = `read ${fmtClock(new Date())}`;
   $('heatNote').textContent = 'When the light is on, hour by hour · last 7 days';
@@ -328,6 +344,51 @@ function showError(err) {
   banner.textContent = `Could not read from Supabase: ${err?.message || err}`;
 }
 
+/* ---------------------------------------------------------------- theme */
+const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
+function currentTheme() {
+  try {
+    return localStorage.getItem(THEME_KEY) || 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+function applyTheme(mode, remember = true) {
+  const dark = mode === 'dark' || (mode === 'auto' && darkQuery.matches);
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  document.querySelectorAll('[data-theme-mode]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.themeMode === mode);
+  });
+  if (remember) {
+    try {
+      localStorage.setItem(THEME_KEY, mode);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function cycleTheme() {
+  const order = ['auto', 'light', 'dark'];
+  applyTheme(order[(order.indexOf(currentTheme()) + 1) % order.length]);
+}
+
+darkQuery.addEventListener('change', () => {
+  if (currentTheme() === 'auto') applyTheme('auto', false);
+});
+
+/* ---------------------------------------------------------------- ranges */
+function setRange(next, updateUrl = true) {
+  range = next;
+  document.querySelectorAll('[data-range]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.range === next);
+  });
+  if (updateUrl) history.replaceState(null, '', `#${next}`);
+  if (rows.length) render();
+}
+
 /* ---------------------------------------------------------------- boot */
 function readConfig() {
   const injected = window.MOTION_CONFIG || {};
@@ -350,13 +411,28 @@ function readConfig() {
 
 async function start() {
   document.querySelectorAll('[data-range]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      range = btn.dataset.range;
-      document.querySelectorAll('[data-range]').forEach((b) => b.classList.toggle('active', b === btn));
-      if (rows.length) render();
-    });
+    btn.addEventListener('click', () => setRange(btn.dataset.range));
   });
+  document.querySelectorAll('[data-theme-mode]').forEach((btn) => {
+    btn.addEventListener('click', () => applyTheme(btn.dataset.themeMode));
+  });
+  applyTheme(currentTheme(), false);
+
+  const fromHash = location.hash.replace('#', '');
+  setRange(['today', '7d', '30d'].includes(fromHash) ? fromHash : 'today', false);
+
+  document.addEventListener('keydown', (event) => {
+    if (event.target instanceof HTMLInputElement || event.metaKey || event.ctrlKey || event.altKey) return;
+    const key = event.key.toLowerCase();
+    if (key === '1') setRange('today');
+    else if (key === '2') setRange('7d');
+    else if (key === '3') setRange('30d');
+    else if (key === 'e') exportCsv();
+    else if (key === 't') cycleTheme();
+  });
+
   $('exportBtn').addEventListener('click', exportCsv);
+  $('wrap').classList.add('ready');
 
   $('setupForm').addEventListener('submit', (event) => {
     event.preventDefault();
