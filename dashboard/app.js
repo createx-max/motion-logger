@@ -180,18 +180,22 @@ function render() {
   const open = rows.find((r) => !r.ended_at);
   const openAge = open ? now - new Date(open.started_at).getTime() : 0;
   const online = lastSeen && now - lastSeen < ONLINE_MS;
-  const active = open && openAge < STALE_OPEN_MS;
+  // ON only counts while the device is actually reporting; a stale open row
+  // from a board that stopped sending must not read as live detection.
+  const active = open && openAge < STALE_OPEN_MS && online;
   const dot = $('dot');
 
   dot.classList.remove('on', 'off');
   if (active) {
     dot.classList.add('on');
     $('liveText').textContent = `Detection Device ON · ${fmtDur(openAge)}`;
-  } else if (open) {
-    $('liveText').textContent = 'open interval — device went quiet';
   } else if (!online) {
     dot.classList.add('off');
-    $('liveText').textContent = lastSeen ? `device offline ${ago(lastSeen)}` : 'no heartbeat yet';
+    $('liveText').textContent = lastSeen
+      ? `device offline · last seen ${ago(lastSeen)}`
+      : 'no heartbeat yet';
+  } else if (open) {
+    $('liveText').textContent = 'open interval — device went quiet';
   } else {
     $('liveText').textContent = 'idle · no motion';
   }
@@ -234,7 +238,7 @@ function render() {
           const s = new Date(r.started_at).getTime();
           let state = '<span class="state end">ended</span>';
           if (!r.ended_at) {
-            state = now - s < STALE_OPEN_MS
+            state = now - s < STALE_OPEN_MS && online
               ? '<span class="state run">running</span>'
               : '<span class="state stale">stale</span>';
           }
@@ -279,6 +283,10 @@ function renderLive() {
   const now = Date.now();
   const open = rows.find((r) => !r.ended_at);
   if (!open) return;
+
+  const lastSeen = device?.last_seen_at ? new Date(device.last_seen_at).getTime() : 0;
+  if (!lastSeen || now - lastSeen >= ONLINE_MS) return;
+
   const age = now - new Date(open.started_at).getTime();
   if (age > STALE_OPEN_MS) return;
   $('liveText').textContent = `Detection Device ON · ${fmtDur(age)}`;
