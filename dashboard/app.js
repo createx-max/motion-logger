@@ -4,7 +4,7 @@ const $ = (id) => document.getElementById(id);
 const HOUR = 3600000;
 const DAY = 86400000;
 const STALE_OPEN_MS = 2 * HOUR;
-const ONLINE_MS = 15 * 60000;
+const ONLINE_MS = 3 * 60000; // firmware heartbeats every 60 s
 const RANGE_DAYS = 30;
 const STORE_KEY = 'motion-logger-config';
 const THEME_KEY = 'motion-logger-theme';
@@ -47,7 +47,11 @@ function ago(ms) {
 
 function rowEnd(row, now) {
   if (row.ended_at) return new Date(row.ended_at).getTime();
-  return Math.min(now, new Date(row.started_at).getTime() + STALE_OPEN_MS);
+  const start = new Date(row.started_at).getTime();
+  const lastSeen = device?.last_seen_at ? new Date(device.last_seen_at).getTime() : 0;
+  // an interval on a silent device ends at its last heartbeat, not "now"
+  const stopAt = lastSeen && now - lastSeen < ONLINE_MS ? now : lastSeen || now;
+  return Math.max(start + 1000, Math.min(stopAt, start + STALE_OPEN_MS));
 }
 
 function bucketize(raw, now) {
@@ -322,7 +326,7 @@ function exportCsv() {
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `motion-log-${range}-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.download = `detection-log-${range}-${new Date().toISOString().slice(0, 10)}.csv`;
   a.click();
   URL.revokeObjectURL(a.href);
 }

@@ -35,7 +35,7 @@ static const int      STATUS_LED_PIN = -1;    // optional extra LED on a free GP
 
 static const uint32_t HOLD_MS      = 2000UL;            // OUT must stay LOW this long to close a session
 static const uint32_t MAX_OPEN_MS  = 30UL * 60UL * 1000UL;  // safety: force-close after 30 min
-static const uint32_t HEARTBEAT_MS = 5UL * 60UL * 1000UL;   // "ping" cadence
+static const uint32_t HEARTBEAT_MS = 60UL * 1000UL;         // "ping" cadence (dashboard calls offline after 3 min)
 static const uint32_t RETRY_MS     = 15000UL;           // retry cadence when offline
 
 // ---------------------------------------------------------------- queue
