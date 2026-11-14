@@ -29,7 +29,7 @@
     --hair: #eae5da;
     --input-bg: #fffdf9;
     --stale: #9a7b1f;
-    --ok: #3f7d4f;
+    --idle-red: #b23b2e;
     --error-rule: #e2c4b7;
     --error-bg: #fbeee7;
     --error-ink: #8c3d22;
@@ -51,7 +51,7 @@
     --hair: #24211d;
     --input-bg: #191714;
     --stale: #c2a24a;
-    --ok: #6fbf86;
+    --idle-red: #e4785f;
     --error-rule: #4a2f26;
     --error-bg: #241a16;
     --error-ink: #e7b9a6;
@@ -75,7 +75,7 @@
   .status { display: inline-flex; align-items: center; gap: 9px; font-size: 13px; color: var(--muted); }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dot-idle); flex: none; }
   .dot.on { background: var(--accent); animation: breathe 2.4s ease-in-out infinite; }
-  .dot.idle { background: var(--ok); }
+  .dot.idle { background: var(--idle-red); }
   .dot.off { background: var(--dot-off); }
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 
