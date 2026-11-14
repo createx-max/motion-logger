@@ -1,8 +1,7 @@
 /*
- * Motion logger - ESP32 WROOM-32 + PIR (HC-SR501 / HC-SR505)
+ * Motion logger 
  * ----------------------------------------------------------
- * Wiring assumed (the LED is driven directly by the PIR module output):
- *
+ *  *
  *   PIR  VCC  -> ESP32 VIN  (5 V, only valid while powered over USB)
  *   PIR  GND  -> ESP32 GND
  *   PIR  OUT  -> ESP32 GPIO14

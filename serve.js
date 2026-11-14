@@ -42,5 +42,5 @@ http
     });
   })
   .listen(port, '127.0.0.1', () => {
-    console.log(`Motion Log dashboard: http://127.0.0.1:${port}`);
+    console.log(`Scintal Sense Data Logger V3: http://127.0.0.1:${port}`);
   });

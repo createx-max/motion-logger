@@ -140,7 +140,7 @@ the new URL and publishable key there instead.)
 
 What you get:
 
-- **Live pill** — `MOTION · light on for 12s` updates every second via Supabase
+- **Live pill** — `Detection Device ON · 12s` updates every second via Supabase
   Realtime; falls back to 60 s polling if the WebSocket is blocked.
 - **KPIs** — light-on time today, number of intervals, longest interval,
   last activity.

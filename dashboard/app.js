@@ -151,7 +151,7 @@ function render() {
   const from = rangeStart(range, now);
   const inRange = rows.filter((r) => new Date(r.started_at).getTime() >= from);
 
-  const labelFor = { today: 'Light on today', '7d': 'Light on · 7 days', '30d': 'Light on · 30 days' };
+  const labelFor = { today: 'ON Duration today', '7d': 'ON Duration · 7 days', '30d': 'ON Duration · 30 days' };
   $('heroLabel').textContent = labelFor[range];
 
   const total = inRange.reduce((sum, r) => {
@@ -186,7 +186,7 @@ function render() {
   dot.classList.remove('on', 'off');
   if (active) {
     dot.classList.add('on');
-    $('liveText').textContent = `motion · light on ${fmtDur(openAge)}`;
+    $('liveText').textContent = `Detection Device ON · ${fmtDur(openAge)}`;
   } else if (open) {
     $('liveText').textContent = 'open interval — device went quiet';
   } else if (!online) {
@@ -281,20 +281,34 @@ function renderLive() {
   if (!open) return;
   const age = now - new Date(open.started_at).getTime();
   if (age > STALE_OPEN_MS) return;
-  $('liveText').textContent = `motion · light on ${fmtDur(age)}`;
+  $('liveText').textContent = `Detection Device ON · ${fmtDur(age)}`;
 }
 
 /* ---------------------------------------------------------------- csv */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60000;
+
+/** UTC instant -> "YYYY-MM-DD HH:mm:ss" in IST, regardless of the viewer's clock */
+function istStamp(ms) {
+  const d = new Date(ms + IST_OFFSET_MS);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
 function exportCsv() {
   const now = Date.now();
   const from = rangeStart(range, now);
   const list = rows.filter((r) => new Date(r.started_at).getTime() >= from).slice().reverse();
-  const lines = ['started_at,ended_at,duration_seconds,state'];
+  const lines = ['started_at_ist,ended_at_ist,duration_seconds,state'];
   for (const r of list) {
-    const s = new Date(r.started_at);
-    const dur = Math.round((rowEnd(r, now) - s.getTime()) / 1000);
+    const s = new Date(r.started_at).getTime();
+    const dur = Math.round((rowEnd(r, now) - s) / 1000);
     lines.push(
-      [s.toISOString(), r.ended_at ? new Date(r.ended_at).toISOString() : '', dur, r.ended_at ? 'ended' : 'running'].join(',')
+      [
+        istStamp(s),
+        r.ended_at ? istStamp(new Date(r.ended_at).getTime()) : '',
+        dur,
+        r.ended_at ? 'ended' : 'running',
+      ].join(',')
     );
   }
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
