@@ -4,7 +4,7 @@ const $ = (id) => document.getElementById(id);
 const HOUR = 3600000;
 const DAY = 86400000;
 const STALE_OPEN_MS = 2 * HOUR;
-const ONLINE_MS = 3 * 60000; // firmware heartbeats every 60 s
+const ONLINE_MS = 2 * 60000; // firmware heartbeats every 30 s
 const RANGE_DAYS = 30;
 const STORE_KEY = 'motion-logger-config';
 const THEME_KEY = 'motion-logger-theme';
@@ -184,25 +184,7 @@ function render() {
   const open = rows.find((r) => !r.ended_at);
   const openAge = open ? now - new Date(open.started_at).getTime() : 0;
   const online = lastSeen && now - lastSeen < ONLINE_MS;
-  // ON only counts while the device is actually reporting; a stale open row
-  // from a board that stopped sending must not read as live detection.
-  const active = open && openAge < STALE_OPEN_MS && online;
-  const dot = $('dot');
-
-  dot.classList.remove('on', 'off');
-  if (active) {
-    dot.classList.add('on');
-    $('liveText').textContent = `Detection Device ON · ${fmtDur(openAge)}`;
-  } else if (!online) {
-    dot.classList.add('off');
-    $('liveText').textContent = lastSeen
-      ? `device offline · last seen ${ago(lastSeen)}`
-      : 'no heartbeat yet';
-  } else if (open) {
-    $('liveText').textContent = 'open interval — device went quiet';
-  } else {
-    $('liveText').textContent = 'idle · no motion';
-  }
+  renderStatus();
 
   /* charts */
   const hourly = hourlyBuckets(now);
@@ -283,17 +265,55 @@ function render() {
   $('heatNote').textContent = 'When the light is on, hour by hour · last 7 days';
 }
 
-function renderLive() {
+/** Device ON/OFF comes from the heartbeat; detection comes from the open interval. */
+function renderStatus() {
   const now = Date.now();
-  const open = rows.find((r) => !r.ended_at);
-  if (!open) return;
-
   const lastSeen = device?.last_seen_at ? new Date(device.last_seen_at).getTime() : 0;
-  if (!lastSeen || now - lastSeen >= ONLINE_MS) return;
+  const online = Boolean(lastSeen) && now - lastSeen < ONLINE_MS;
+  const open = rows.find((r) => !r.ended_at);
+  const openAge = open ? now - new Date(open.started_at).getTime() : 0;
+  const detecting = open && openAge < STALE_OPEN_MS && online;
 
-  const age = now - new Date(open.started_at).getTime();
-  if (age > STALE_OPEN_MS) return;
-  $('liveText').textContent = `Detection Device ON · ${fmtDur(age)}`;
+  const dot = $('dot');
+  dot.classList.remove('on', 'idle', 'off');
+
+  if (!online) {
+    dot.classList.add('off');
+    $('liveText').textContent = lastSeen
+      ? `Detection Device OFF · last seen ${ago(lastSeen)}`
+      : 'Detection Device OFF · no heartbeat yet';
+    return;
+  }
+
+  if (detecting) {
+    dot.classList.add('on');
+    $('liveText').textContent = `Detection Device ON · detecting ${fmtDur(openAge)}`;
+    return;
+  }
+
+  dot.classList.add('idle');
+  $('liveText').textContent = 'Detection Device ON · idle';
+}
+
+function renderLive() {
+  renderStatus();
+}
+
+/* ---------------------------------------------------------------- clear */
+async function clearLog() {
+  if (!sb) return;
+  const key = window.prompt('Admin key required to clear the log:');
+  if (!key) return;
+  if (!window.confirm('Delete every logged interval? This cannot be undone.')) return;
+
+  const { data, error } = await sb.rpc('clear_motion_log', { p_key: key.trim() });
+  if (error) {
+    window.alert(`Could not clear: ${error.message}`);
+    return;
+  }
+
+  await load();
+  window.alert(`Cleared ${data ?? 0} interval${data === 1 ? '' : 's'}.`);
 }
 
 /* ---------------------------------------------------------------- csv */
@@ -458,6 +478,7 @@ async function start() {
   });
 
   $('exportBtn').addEventListener('click', exportCsv);
+  $('clearBtn').addEventListener('click', clearLog);
   $('wrap').classList.add('ready');
 
   $('setupForm').addEventListener('submit', (event) => {
