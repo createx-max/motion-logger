@@ -1,19 +1,20 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-/* ------------------------------------------------------------------ config */
 const $ = (id) => document.getElementById(id);
 const HOUR = 3600000;
 const DAY = 86400000;
-const STALE_OPEN_MS = 2 * HOUR;      // an open interval older than this is not "live"
-const ONLINE_MS = 15 * 60000;        // device heartbeat is every 5 min
-const RANGE_DAYS = 30;               // history pulled for the reports
+const STALE_OPEN_MS = 2 * HOUR;
+const ONLINE_MS = 15 * 60000;
+const RANGE_DAYS = 30;
 const STORE_KEY = 'motion-logger-config';
 
 let sb = null;
 let rows = [];
 let device = null;
+let range = 'today';
+let reloadTimer = null;
 
-/* ------------------------------------------------------------------ helpers */
+/* ---------------------------------------------------------------- helpers */
 function fmtDur(ms) {
   if (!Number.isFinite(ms) || ms < 0) ms = 0;
   const s = Math.round(ms / 1000);
@@ -21,7 +22,7 @@ function fmtDur(ms) {
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
   if (h) return `${h}h ${m}m`;
-  if (m) return `${m}m ${sec}s`;
+  if (m) return `${m}m`;
   return `${sec}s`;
 }
 
@@ -43,22 +44,18 @@ function ago(ms) {
   return `${Math.round(diff / DAY)} d ago`;
 }
 
-/** End of a session: real end, or "now" while it runs. Stale opens are capped. */
 function rowEnd(row, now) {
   if (row.ended_at) return new Date(row.ended_at).getTime();
   return Math.min(now, new Date(row.started_at).getTime() + STALE_OPEN_MS);
 }
 
-/** Sum overlapping intervals into fixed buckets, counting starts per bucket. */
 function bucketize(raw, now) {
   const buckets = raw.map((b) => ({ ...b, value: 0, count: 0, longest: 0 }));
-
   for (const row of rows) {
     const s = new Date(row.started_at).getTime();
     const e = rowEnd(row, now);
     if (!(e > s)) continue;
     const dur = e - s;
-
     for (const b of buckets) {
       const overlap = Math.min(e, b.end) - Math.max(s, b.start);
       if (overlap <= 0) continue;
@@ -93,130 +90,207 @@ function dailyBuckets(now, days) {
   return bucketize(raw, now);
 }
 
-/* ------------------------------------------------------------------ render */
+function rangeStart(r, now) {
+  if (r === 'today') return startOfDay(now);
+  return now - (r === '7d' ? 7 : 30) * DAY;
+}
+
+/* ---------------------------------------------------------------- charts */
 function renderChart(host, data, labelEvery, labelFn) {
   const max = Math.max(1, ...data.map((d) => d.value));
+  const nowHour = new Date().setMinutes(0, 0, 0);
   host.innerHTML = data
-    .map((d, i) => {
-      const pct = d.value > 0 ? Math.max(3, (d.value / max) * 100) : 0;
-      const title = `${labelFn(d.start)} · ${d.value ? fmtDur(d.value) : 'no motion'}`;
-      const label =
-        i % labelEvery === 0
-          ? `<span class="barlabel">${labelFn(d.start)}</span>`
-          : '<span class="barlabel">&nbsp;</span>';
-      return `<div class="slot" title="${title}">
-        <div class="barwrap"><div class="bar${d.value ? '' : ' empty'}" style="height:${pct}%"></div></div>
-        ${label}
+    .map((d) => {
+      const pct = d.value > 0 ? Math.max(2, (d.value / max) * 100) : 0;
+      const isNow = d.start === nowHour || (d.end - d.start >= DAY && d.end > Date.now());
+      const mins = Math.round(d.value / 60000);
+      return `<div class="col${isNow ? ' now' : ''}" title="${labelFn(d.start)} · ${mins} min on">
+        <div class="fill" style="height:${pct}%"></div>
       </div>`;
     })
     .join('');
 }
 
+function renderHeatmap(now) {
+  const host = $('heatmap');
+  const today = startOfDay(now);
+  const days = [];
+  for (let i = 6; i >= 0; i--) days.push(startOfDay(today - i * DAY));
+
+  const raw = [];
+  for (const day of days) {
+    for (let h = 0; h < 24; h++) raw.push({ start: day + h * HOUR, end: day + (h + 1) * HOUR });
+  }
+  const buckets = bucketize(raw, now);
+
+  const cells = [];
+  cells.push('<span></span>');
+  for (let h = 0; h < 24; h++) {
+    cells.push(`<span class="hour">${h % 3 === 0 ? h : ''}</span>`);
+  }
+  days.forEach((day, di) => {
+    cells.push(`<span class="day">${new Date(day).toLocaleDateString([], { weekday: 'short' })}</span>`);
+    for (let h = 0; h < 24; h++) {
+      const v = buckets[di * 24 + h].value;
+      const mins = v / 60000;
+      const alpha = mins > 0 ? Math.min(0.92, 0.12 + Math.min(1, mins / 20) * 0.8) : 0;
+      const bg = alpha ? `rgba(180,71,31,${alpha.toFixed(2)})` : '';
+      cells.push(
+        `<span class="cell" style="${bg ? `background:${bg}` : ''}" title="${new Date(day).toLocaleDateString()} ${h}:00 · ${Math.round(mins)} min"></span>`
+      );
+    }
+  });
+  host.innerHTML = cells.join('');
+}
+
+/* ---------------------------------------------------------------- render */
 function render() {
   const now = Date.now();
-  const todayStart = startOfDay(now);
-  const todayRows = rows.filter((r) => new Date(r.started_at).getTime() >= todayStart);
+  const from = rangeStart(range, now);
+  const inRange = rows.filter((r) => new Date(r.started_at).getTime() >= from);
 
-  const todayMs = todayRows.reduce(
-    (sum, r) => sum + Math.max(0, rowEnd(r, now) - Math.max(new Date(r.started_at).getTime(), todayStart)),
-    0
-  );
+  const labelFor = { today: 'Light on today', '7d': 'Light on · 7 days', '30d': 'Light on · 30 days' };
+  $('heroLabel').textContent = labelFor[range];
 
-  const durations = todayRows.map((r) => rowEnd(r, now) - new Date(r.started_at).getTime());
+  const total = inRange.reduce((sum, r) => {
+    const s = Math.max(new Date(r.started_at).getTime(), from);
+    return sum + Math.max(0, rowEnd(r, now) - s);
+  }, 0);
+
+  const durations = inRange.map((r) => rowEnd(r, now) - new Date(r.started_at).getTime());
   const longest = durations.length ? Math.max(...durations) : 0;
-  const elapsedToday = Math.max(1, now - todayStart);
+  const span = Math.max(1, now - from);
 
-  $('kpiToday').textContent = fmtDur(todayMs);
-  $('kpiTodayMeta').textContent = todayRows.length
-    ? `${((todayMs / elapsedToday) * 100).toFixed(1)}% of the day so far`
-    : 'no motion yet today';
+  $('kpiToday').textContent = fmtDur(total);
+  $('kpiTodayMeta').textContent = inRange.length
+    ? `${((total / span) * 100).toFixed(1)}% of the period${inRange.length > 1 ? ` · avg ${fmtDur(total / inRange.length)}` : ''}`
+    : 'no motion in this period';
 
-  $('kpiCount').textContent = String(todayRows.length);
-  $('kpiCountMeta').textContent = todayRows.length
-    ? `avg ${fmtDur(todayMs / todayRows.length)} each`
-    : '—';
-
+  $('kpiCount').textContent = String(inRange.length);
   $('kpiLongest').textContent = longest ? fmtDur(longest) : '—';
-  $('kpiLongestMeta').textContent = longest ? 'single interval' : '—';
 
   const lastSeen = device?.last_seen_at ? new Date(device.last_seen_at).getTime() : 0;
   const lastEvent = rows.length ? new Date(rows[0].started_at).getTime() : 0;
   const lastAny = Math.max(lastSeen, lastEvent);
-
   $('kpiLast').textContent = ago(lastAny);
-  $('kpiLastMeta').textContent = lastAny ? new Date(lastAny).toLocaleString() : 'waiting for first event';
 
   /* live state */
   const open = rows.find((r) => !r.ended_at);
   const openAge = open ? now - new Date(open.started_at).getTime() : 0;
   const online = lastSeen && now - lastSeen < ONLINE_MS;
   const active = open && openAge < STALE_OPEN_MS;
+  const dot = $('dot');
 
-  const pill = $('livePill');
-  const text = $('liveText');
-  pill.classList.remove('live', 'offline');
-
+  dot.classList.remove('on', 'off');
   if (active) {
-    pill.classList.add('live');
-    text.textContent = `MOTION · light on for ${fmtDur(openAge)}`;
+    dot.classList.add('on');
+    $('liveText').textContent = `motion · light on ${fmtDur(openAge)}`;
   } else if (open) {
-    pill.classList.add('offline');
-    text.textContent = 'open interval — device went quiet';
+    $('liveText').textContent = 'open interval — device went quiet';
   } else if (!online) {
-    pill.classList.add('offline');
-    text.textContent = lastSeen ? `device offline · ${ago(lastSeen)}` : 'no device heartbeat yet';
+    dot.classList.add('off');
+    $('liveText').textContent = lastSeen ? `device offline ${ago(lastSeen)}` : 'no heartbeat yet';
   } else {
-    text.textContent = 'idle · no motion';
+    $('liveText').textContent = 'idle · no motion';
   }
 
-  $('updated').textContent = `updated ${fmtClock(new Date())}`;
+  /* charts */
+  const hourly = hourlyBuckets(now);
+  const daily = dailyBuckets(now, 14);
+  renderChart($('chartHourly'), hourly, 3, (t) => fmtClock(new Date(t)));
+  renderChart($('chartDaily'), daily, 2, (t) => fmtDay(new Date(t)));
+  $('axStart').textContent = fmtClock(new Date(hourly[0].start));
+  $('axDayStart').textContent = fmtDay(new Date(daily[0].start));
 
-  renderChart($('chartHourly'), hourlyBuckets(now), 3, (t) => fmtClock(new Date(t)));
-  renderChart($('chartDaily'), dailyBuckets(now, 14), 2, (t) => fmtDay(new Date(t)));
+  renderHeatmap(now);
 
-  /* daily report */
-  const days = dailyBuckets(now, 7).reverse();
-  $('dailyBody').innerHTML = days
+  /* daily table */
+  $('dailyBody').innerHTML = dailyBuckets(now, 7)
+    .reverse()
     .map((d) => {
-      const span = Math.max(1, Math.min(d.end, now) - d.start);
+      const daySpan = Math.max(1, Math.min(d.end, now) - d.start);
       return `<tr>
         <td>${new Date(d.start).toLocaleDateString([], { weekday: 'short', day: '2-digit', month: 'short' })}</td>
-        <td class="num">${d.count}</td>
-        <td class="num">${fmtDur(d.value)}</td>
-        <td class="num">${d.longest ? fmtDur(d.longest) : '—'}</td>
-        <td class="num">${((d.value / span) * 100).toFixed(1)}%</td>
+        <td class="n">${d.count}</td>
+        <td class="n">${fmtDur(d.value)}</td>
+        <td class="n">${d.longest ? fmtDur(d.longest) : '—'}</td>
+        <td class="n">${((d.value / daySpan) * 100).toFixed(1)}%</td>
       </tr>`;
     })
     .join('');
 
-  /* recent intervals */
-  const latest = rows.slice(0, 25);
-  $('sessionBody').innerHTML = latest.length
-    ? latest
+  /* intervals table */
+  const shown = inRange.slice(0, 50);
+  $('sessionNote').textContent = inRange.length
+    ? `${inRange.length} interval${inRange.length === 1 ? '' : 's'}${inRange.length > shown.length ? ` · showing latest ${shown.length}` : ''}`
+    : 'nothing recorded in this period';
+
+  $('sessionBody').innerHTML = shown.length
+    ? shown
         .map((r) => {
           const s = new Date(r.started_at).getTime();
-          let tag = '<span class="tag done">ended</span>';
+          let state = '<span class="state end">ended</span>';
           if (!r.ended_at) {
-            tag = now - s < STALE_OPEN_MS
-              ? '<span class="tag live">running</span>'
-              : '<span class="tag stale">stale</span>';
+            state = now - s < STALE_OPEN_MS
+              ? '<span class="state run">running</span>'
+              : '<span class="state stale">stale</span>';
           }
           return `<tr>
             <td>${new Date(s).toLocaleString([], {
               day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit',
             })}</td>
-            <td class="num">${fmtDur(rowEnd(r, now) - s)}</td>
-            <td>${tag}</td>
+            <td class="n">${fmtDur(rowEnd(r, now) - s)}</td>
+            <td>${state}</td>
           </tr>`;
         })
         .join('')
-    : '<tr class="empty-row"><td colspan="3">No motion recorded yet — wave at the sensor.</td></tr>';
+    : '<tr><td colspan="3" class="empty">No motion recorded yet</td></tr>';
+
+  /* footer */
+  const busiest = (() => {
+    const b = hourlyBuckets(now).slice().sort((a, x) => x.value - a.value)[0];
+    return b && b.value > 0 ? fmtClock(new Date(b.start)) : null;
+  })();
+  $('footMeta').textContent = rows.length
+    ? `${rows.length} intervals in the last ${RANGE_DAYS} days${busiest ? ` · busiest hour ${busiest}` : ''}`
+    : 'waiting for the first interval';
+  $('updated').textContent = `read ${fmtClock(new Date())}`;
+  $('heatNote').textContent = 'When the light is on, hour by hour · last 7 days';
 }
 
-/* ------------------------------------------------------------------ data */
+function renderLive() {
+  const now = Date.now();
+  const open = rows.find((r) => !r.ended_at);
+  if (!open) return;
+  const age = now - new Date(open.started_at).getTime();
+  if (age > STALE_OPEN_MS) return;
+  $('liveText').textContent = `motion · light on ${fmtDur(age)}`;
+}
+
+/* ---------------------------------------------------------------- csv */
+function exportCsv() {
+  const now = Date.now();
+  const from = rangeStart(range, now);
+  const list = rows.filter((r) => new Date(r.started_at).getTime() >= from).slice().reverse();
+  const lines = ['started_at,ended_at,duration_seconds,state'];
+  for (const r of list) {
+    const s = new Date(r.started_at);
+    const dur = Math.round((rowEnd(r, now) - s.getTime()) / 1000);
+    lines.push(
+      [s.toISOString(), r.ended_at ? new Date(r.ended_at).toISOString() : '', dur, r.ended_at ? 'ended' : 'running'].join(',')
+    );
+  }
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `motion-log-${range}-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------------------------------------------------------------- data */
 async function load() {
   const since = new Date(Date.now() - RANGE_DAYS * DAY).toISOString();
-
   const [sessions, status] = await Promise.all([
     sb
       .from('motion_sessions')
@@ -229,14 +303,12 @@ async function load() {
 
   if (sessions.error) throw sessions.error;
   rows = sessions.data || [];
-
   device = status.error ? null : (status.data || [])[0] || null;
 
   $('errorBanner').hidden = true;
   render();
 }
 
-let reloadTimer = null;
 function scheduleReload() {
   if (reloadTimer) return;
   reloadTimer = setTimeout(async () => {
@@ -255,7 +327,7 @@ function showError(err) {
   banner.textContent = `Could not read from Supabase: ${err?.message || err}`;
 }
 
-/* ------------------------------------------------------------------ boot */
+/* ---------------------------------------------------------------- boot */
 function readConfig() {
   const injected = window.MOTION_CONFIG || {};
   if (
@@ -270,12 +342,30 @@ function readConfig() {
     const saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
     if (saved?.url && saved?.key) return saved;
   } catch {
-    /* corrupt storage, ignore */
+    /* ignore */
   }
   return null;
 }
 
 async function start() {
+  document.querySelectorAll('[data-range]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      range = btn.dataset.range;
+      document.querySelectorAll('[data-range]').forEach((b) => b.classList.toggle('active', b === btn));
+      if (rows.length) render();
+    });
+  });
+  $('exportBtn').addEventListener('click', exportCsv);
+
+  $('setupForm').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const url = $('inUrl').value.trim().replace(/\/+$/, '');
+    const key = $('inKey').value.trim();
+    if (!url || !key) return;
+    localStorage.setItem(STORE_KEY, JSON.stringify({ url, key }));
+    location.reload();
+  });
+
   const cfg = readConfig();
   if (!cfg) {
     $('setupBanner').hidden = false;
@@ -292,7 +382,6 @@ async function start() {
     showError(err);
   }
 
-  /* realtime: any insert/update on motion_sessions refreshes the view */
   sb.channel('motion-logger')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'motion_sessions' }, scheduleReload)
     .subscribe((status) => {
@@ -301,24 +390,12 @@ async function start() {
       }
     });
 
-  /* keeps the running interval ticking without re-querying */
-  setInterval(() => {
-    if (rows.length || device) render();
-  }, 1000);
+  // cheap 1s tick: keeps the running timer alive without rebuilding the DOM
+  setInterval(renderLive, 1000);
 
-  /* safety net if realtime is blocked on this network */
   setInterval(() => {
     load().catch(showError);
   }, 60000);
 }
-
-$('setupForm').addEventListener('submit', (event) => {
-  event.preventDefault();
-  const url = $('inUrl').value.trim().replace(/\/+$/, '');
-  const key = $('inKey').value.trim();
-  if (!url || !key) return;
-  localStorage.setItem(STORE_KEY, JSON.stringify({ url, key }));
-  location.reload();
-});
 
 start();
