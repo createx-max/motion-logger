@@ -265,6 +265,45 @@ function render() {
   $('heatNote').textContent = 'When the light is on, hour by hour · last 7 days';
 }
 
+/* -------------------------------------------------------------- alerts */
+const ALERT_KEY = 'motion-logger-alerts';
+let alertsOn = localStorage.getItem(ALERT_KEY) === '1';
+let prevState = null;
+
+function notify(title, body) {
+  if (!alertsOn || !('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    new Notification(title, { body });
+  } catch {
+    /* some browsers only allow notifications from a service worker */
+  }
+}
+
+async function toggleAlerts() {
+  const btn = $('alertBtn');
+  if (!('Notification' in window)) {
+    window.alert('This browser does not support notifications.');
+    return;
+  }
+
+  if (!alertsOn) {
+    const permission = Notification.permission === 'granted'
+      ? 'granted'
+      : await Notification.requestPermission();
+    if (permission !== 'granted') {
+      window.alert('Notifications are blocked for this site. Allow them in the browser, then try again.');
+      return;
+    }
+    alertsOn = true;
+  } else {
+    alertsOn = false;
+  }
+
+  localStorage.setItem(ALERT_KEY, alertsOn ? '1' : '0');
+  btn.classList.toggle('active', alertsOn);
+  btn.textContent = alertsOn ? 'Alerts on' : 'Alerts';
+}
+
 /** Device ON/OFF comes from the heartbeat; detection comes from the open interval. */
 function renderStatus() {
   const now = Date.now();
@@ -273,6 +312,23 @@ function renderStatus() {
   const open = rows.find((r) => !r.ended_at);
   const openAge = open ? now - new Date(open.started_at).getTime() : 0;
   const detecting = open && openAge < STALE_OPEN_MS && online;
+
+  /* tab title + alerts */
+  const state = !online ? 'off' : detecting ? 'detecting' : 'idle';
+  document.title = state === 'off'
+    ? 'OFF · Scintal Sense'
+    : state === 'detecting'
+      ? `ON ${fmtDur(openAge)} · Scintal Sense`
+      : 'ON idle · Scintal Sense';
+
+  if (prevState && prevState !== state) {
+    if (state === 'detecting') {
+      notify('Motion detected', `Detection device ON at ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
+    } else if (state === 'off') {
+      notify('Detection device OFF', 'The board stopped sending heartbeats.');
+    }
+  }
+  prevState = state;
 
   const dot = $('dot');
   dot.classList.remove('on', 'idle', 'off');
@@ -479,6 +535,9 @@ async function start() {
 
   $('exportBtn').addEventListener('click', exportCsv);
   $('clearBtn').addEventListener('click', clearLog);
+  $('alertBtn').addEventListener('click', toggleAlerts);
+  $('alertBtn').classList.toggle('active', alertsOn);
+  $('alertBtn').textContent = alertsOn ? 'Alerts on' : 'Alerts';
   $('wrap').classList.add('ready');
 
   $('setupForm').addEventListener('submit', (event) => {
