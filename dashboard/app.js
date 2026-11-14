@@ -134,7 +134,8 @@ function renderHeatmap(now) {
       const v = buckets[di * 24 + h].value;
       const mins = v / 60000;
       const alpha = mins > 0 ? Math.min(0.92, 0.12 + Math.min(1, mins / 20) * 0.8) : 0;
-      const bg = alpha ? `rgba(180,71,31,${alpha.toFixed(2)})` : '';
+      // color-mix keeps the heatmap in step with the active light/dark accent
+      const bg = alpha ? `color-mix(in srgb, var(--accent) ${Math.round(alpha * 100)}%, transparent)` : '';
       cells.push(
         `<span class="cell" style="${bg ? `background:${bg}` : ''}" title="${new Date(day).toLocaleDateString()} ${h}:00 · ${Math.round(mins)} min"></span>`
       );
