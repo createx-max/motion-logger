@@ -12,7 +12,7 @@ const DAY = 86400000; // 24 * 60 * 60 * 1000
 const STALE_OPEN_MS = 2 * HOUR;
 
 // The board pings every 30 s; after this much silence we call the device OFF.
-const ONLINE_MS = 2 * 60000; // 2 minutes
+const ONLINE_MS = 3 * 60000; // 3 minutes = six missed heartbeats, so one slow ping is not "OFF"
 
 // How far back we pull rows from the database.
 const RANGE_DAYS = 30;
@@ -185,7 +185,7 @@ function renderHeatmap(now) {
 function render() {
   const now = Date.now(); // one "now" for the whole pass, so numbers agree
   const from = rangeStart(range, now); // start of the active range
-  const inRange = rows.filter((r) => new Date(r.started_at).getTime() >= from); // intervals in range
+  const inRange = rows.filter((r) => rowEnd(r, now) > from); // an interval that started before the range but ran into it still counts
 
   const labelFor = { today: 'ON Duration today', '7d': 'ON Duration · 7 days', '30d': 'ON Duration · 30 days' }; // hero wording
   $('heroLabel').textContent = labelFor[range]; // show it
@@ -195,7 +195,7 @@ function render() {
     return sum + Math.max(0, rowEnd(r, now) - s); // add their on-time inside the range
   }, 0);
 
-  const durations = inRange.map((r) => rowEnd(r, now) - new Date(r.started_at).getTime()); // every interval length
+  const durations = inRange.map((r) => Math.max(0, rowEnd(r, now) - Math.max(new Date(r.started_at).getTime(), from))); // length inside the range
   const longest = durations.length ? Math.max(...durations) : 0; // the longest one, or 0
   const span = Math.max(1, now - from); // length of the period, never 0
 
@@ -424,7 +424,7 @@ function istStamp(ms) {
 function exportCsv() {
   const now = Date.now(); // one "now" for every row
   const from = rangeStart(range, now); // active range start
-  const list = rows.filter((r) => new Date(r.started_at).getTime() >= from).slice().reverse(); // oldest first
+  const list = rows.filter((r) => rowEnd(r, now) > from).slice().reverse(); // oldest first, midnight-spanning rows included
   const lines = ['started_at_ist,ended_at_ist,duration_seconds,state']; // header
   for (const r of list) {
     const s = new Date(r.started_at).getTime(); // start
