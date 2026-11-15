@@ -199,3 +199,83 @@ create or replace view public.motion_daily as
   group by 1, 2;
 
 grant select on public.motion_daily to anon, authenticated;
+
+-- ---------------------------------------------------------------------
+-- 8. Admin actions ("Clear log") and stale-session cleanup
+-- ---------------------------------------------------------------------
+create table if not exists public.app_settings (
+  key   text primary key,
+  value text not null
+);
+
+-- No policies: the key can never be read with the publishable key.
+alter table public.app_settings enable row level security;
+
+insert into public.app_settings (key, value)
+values ('admin_key', 'SenseKinetics')
+on conflict (key) do nothing;
+
+-- Delete every logged interval. A bare DELETE is rejected by the database's
+-- safe-update guard ("DELETE requires a WHERE clause"), hence "where true".
+create or replace function public.clear_motion_log(p_key text)
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_count int;
+begin
+  if not exists (
+    select 1 from public.app_settings
+     where key = 'admin_key' and value = p_key
+  ) then
+    raise exception 'invalid admin key' using errcode = '28000';
+  end if;
+
+  delete from public.motion_sessions where true;
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;
+
+revoke all on function public.clear_motion_log(text) from public;
+grant execute on function public.clear_motion_log(text) to anon, authenticated;
+
+-- Close a session left open by a board that went silent (power off / Wi-Fi loss).
+-- The interval ends at the last heartbeat, never at "now".
+create or replace function public.close_stale_sessions(p_grace_minutes int default 3)
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_count int;
+begin
+  with stale as (
+    update public.motion_sessions s
+       set ended_at = greatest(s.started_at + interval '1 second', d.last_seen_at)
+      from public.devices d
+     where s.device_id = d.id
+       and s.ended_at is null
+       and d.last_seen_at < now() - make_interval(mins => p_grace_minutes)
+    returning s.id
+  )
+  select count(*) into v_count from stale;
+
+  return v_count;
+end;
+$$;
+
+-- Run it every minute when pg_cron is installed.
+do $$
+begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    begin
+      perform cron.unschedule('close-stale-sessions');
+    exception when others then null;
+    end;
+    perform cron.schedule('close-stale-sessions', '* * * * *', 'select public.close_stale_sessions(3)');
+  end if;
+end $$;
