@@ -104,6 +104,25 @@ begin
        and started_at <= v_ts
     returning id into v_id;
 
+    -- A heartbeat gap (or the stale-session cron) can close the row before the
+    -- real stop arrives. Extend that recently closed interval instead of
+    -- dropping the extra time.
+    if v_id is null then
+      update public.motion_sessions
+         set ended_at = v_ts
+       where id = (
+         select id from public.motion_sessions
+          where device_id = v_device
+            and ended_at is not null
+            and started_at <= v_ts
+            and ended_at < v_ts
+            and ended_at > v_ts - interval '15 minutes'
+          order by started_at desc
+          limit 1
+       )
+      returning id into v_id;
+    end if;
+
   elsif p_event = 'ping' then
     v_id := null;   -- heartbeat: only refreshes devices.last_seen_at
 
