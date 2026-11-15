@@ -2,14 +2,14 @@
  * Scintal Sense Data Logger V3 — ESP32 firmware
  * ----------------------------------------------------------
  * Wiring
- *   PIR  VCC  -> ESP32 VIN  (5 V, only valid while powered over USB)
- *   PIR  GND  -> ESP32 GND
- *   PIR  OUT  -> ESP32 GPIO14
- *   LED  +    -> PIR OUT    (through a 220-330 ohm resistor)
- *   LED  -    -> PIR GND
+ *   SENSOR  VCC  -> ESP32 VIN  (5 V, only valid while powered over USB)
+ *   SENSOR  GND  -> ESP32 GND
+ *   SENSOR  OUT  -> ESP32 GPIO14
+ *   LED  +    -> SENSOR OUT    (through a 220-330 ohm resistor)
+ *   LED  -    -> SENSOR GND
  *
  * What it does
- *   Reads the PIR output and turns every "light on" period into one row in
+ *   Reads the SENSOR output and turns every "light on" period into one row in
  *   Supabase, using the motion_event() database function:
  *
  *     start -> inserts a row and stamps started_at
@@ -29,12 +29,11 @@
 #include <HTTPClient.h>       // simple POST helper on top of the TLS socket
 #include <time.h>             // time(), gmtime_r(), strftime() for UTC stamps
 
-#include "secrets.h"          // Wi-Fi name/password, Supabase URL + key, device key (never committed)
-
+#include "secrets.h"          // Wi-Fi name/password, Supabase URL + key, device key 
 // ---------------------------------------------------------------- settings
 
-// GPIO wired to the PIR OUT pin.
-static const int      PIR_PIN        = 14;
+// GPIO wired to the  OUT pin.
+static const int      SENSOR_PIN        = 14;
 
 // Optional extra LED on a free GPIO; -1 means "not fitted".
 static const int      STATUS_LED_PIN = -1;
@@ -69,7 +68,7 @@ static uint8_t  qCount = 0; // how many items are waiting
 
 // ---------------------------------------------------------------- state
 
-// True while the PIR output is being logged as one open session.
+// True while the SENSOR output is being logged as one open session.
 static bool     sessionActive  = false;
 
 // millis() at which the current session started.
@@ -221,7 +220,7 @@ void setup() {
   Serial.println();                             // blank line
   Serial.println("=== motion logger booting ==="); // banner
 
-  pinMode(PIR_PIN, INPUT);                      // PIR OUT is an input to us
+  pinMode(SENSOR_PIN, INPUT);                      // SENSOR OUT is an input to us
   if (STATUS_LED_PIN >= 0) pinMode(STATUS_LED_PIN, OUTPUT); // optional LED is an output
   setStatusLed(false);                          // start with the LED off
 
@@ -229,7 +228,7 @@ void setup() {
   syncTime();                                   // then set the clock
 
   lastHeartbeatMs = millis();                   // first heartbeat is due 30 s from now
-  Serial.println("[pir] warming up - give the sensor ~60 s to settle"); // PIR needs time
+  Serial.println("[SENSOR] warming up - give the sensor ~60 s to settle"); // SENSOR needs time
   Serial.println("[boot] done, watching GPIO14"); // ready
 }
 
@@ -238,10 +237,10 @@ void setup() {
 // Runs forever, several times per second.
 void loop() {
   const uint32_t now = millis();                // current uptime in ms
-  const int      pir = digitalRead(PIR_PIN);    // HIGH = motion, LED lit
+  const int      SENSOR = digitalRead(SENSOR_PIN);    // HIGH = motion, LED lit
 
   if (!sessionActive) {
-    if (pir == HIGH) {                          // motion started
+    if (SENSOR == HIGH) {                          // motion started
       sessionActive  = true;                    // open a session
       sessionStartMs = now;                     // remember when
       lastHighMs     = now;                     // last confirmed HIGH
@@ -251,7 +250,7 @@ void loop() {
       enqueue("start", sessionStartTs);         // tell the server
     }
   } else {
-    if (pir == HIGH) lastHighMs = now;          // still detecting: keep the end time fresh
+    if (SENSOR == HIGH) lastHighMs = now;          // still detecting: keep the end time fresh
 
     const uint32_t held  = now - lastHighMs;    // time since the last HIGH
     const uint32_t total = now - sessionStartMs; // how long this session has run
