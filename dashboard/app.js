@@ -12,7 +12,7 @@ const DAY = 86400000; // 24 * 60 * 60 * 1000
 const STALE_OPEN_MS = 2 * HOUR;
 
 // The board pings every 30 s; after this much silence we call the device OFF.
-const ONLINE_MS = 3 * 60000; // 3 minutes = six missed heartbeats, so one slow ping is not "OFF"
+const ONLINE_MS = 60000; // 60 s: two missed 30 s heartbeats (or four missed 15 s ones) mean the board is gone
 
 // How far back we pull rows from the database.
 const RANGE_DAYS = 30;

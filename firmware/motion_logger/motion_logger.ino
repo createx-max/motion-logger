@@ -44,8 +44,9 @@ static const uint32_t HOLD_MS      = 2000UL;
 // Safety valve: never let one session run longer than 30 minutes.
 static const uint32_t MAX_OPEN_MS  = 30UL * 60UL * 1000UL;
 
-// Heartbeat cadence; the dashboard treats 2 minutes of silence as device OFF.
-static const uint32_t HEARTBEAT_MS = 30UL * 1000UL;
+// Heartbeat cadence; the dashboard treats 60 s of silence as device OFF,
+// so four missed pings inside a minute are enough to notice a power cut.
+static const uint32_t HEARTBEAT_MS = 15UL * 1000UL;
 
 // How often a stuck queue is retried while offline.
 static const uint32_t RETRY_MS     = 15000UL;
