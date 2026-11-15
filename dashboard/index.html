@@ -59,6 +59,9 @@
   }
   * { box-sizing: border-box; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+  /* keyboard users must always see where they are, even in browsers that
+     never report :focus-visible for programmatic or synthetic focus */
+  button:focus, a:focus, [tabindex]:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
   html { -webkit-text-size-adjust: 100%; }
   body {
     margin: 0;
