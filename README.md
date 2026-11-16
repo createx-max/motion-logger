@@ -142,6 +142,11 @@ How the sketch behaves:
 - Failed requests are queued in RAM (16 items) and retried every 15 s; a new
   item is sent immediately. A full queue drops heartbeats before it ever drops
   a measured interval.
+- **self-healing link**: an association in flight is never interrupted (calling
+  `WiFi.begin()` again aborts it, which used to turn a 5 s join into a minute),
+  and if the radio says it is online but nothing has reached the server for
+  2 min the board restarts itself instead of staying mute for hours. Both used
+  to surface as the pill showing OFF while the sensor was still lit.
 - Times are UTC from NTP; if the clock is not synced yet the interval waits in
   the queue until it is, instead of being written with a wrong time.
 
@@ -207,6 +212,7 @@ select * from motion_daily order by day desc limit 14;
 | Live pill says "device offline" | No heartbeat for 30 s: board unplugged, Wi-Fi down, or PIR on a 5 GHz SSID. |
 | Live timer never starts | `[sync] live start ok` missing in the serial log: the `active_since` column or the devices PATCH is missing — re-run `schema.sql`. |
 | Live timer keeps running with no motion | Stale marker after a power cut; the next heartbeat (10 s) clears it, or run the SQL below. |
+| Pill says OFF while the sensor is lit | Check the serial log: `[watchdog] no upload … restarting` or repeated `[http] presence -> -1` means the link wedged and the board rebooted itself; `last_seen_at` in `device_status` shows whether the server was ever told. |
 | `[http] heartbeat -> 400` `21000` | Old schema/patch without a filter: re-run `schema.sql` and re-flash the sketch. |
 | `permission denied for table devices` on a direct read | Expected: `devices` is column-granted and `device_key` is never readable; use the `device_status` view. |
 | Interval stuck as "stale" | Board lost power mid-session; it closes itself on the next `start` (or see the SQL below). |

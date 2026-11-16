@@ -117,6 +117,11 @@ static time_t   sessionStartTs = 0;
 
 // millis() of the last heartbeat we queued.
 static uint32_t lastHeartbeatMs = 0;
+// Last moment the server actually answered. If the Wi-Fi stack or a TLS call
+// wedges, the board goes silent while the dashboard quite correctly calls it
+// OFF; a restart is then the only way back, and it costs at most one interval.
+static uint32_t lastUploadOkMs = 0;
+static const uint32_t WATCHDOG_MS = 120UL * 1000UL; // 2 min of silence while online
 
 // millis() of the last delivery attempt.
 static uint32_t lastRetryMs     = 0;
@@ -391,20 +396,28 @@ static void flushQueue() {
       Serial.println("[sync] heartbeat ok");
     }
     lastHeartbeatMs = millis();                 // every upload already proves presence
+    lastUploadOkMs  = millis();                 // the link is alive, so the watchdog stays quiet
     qHead = (uint8_t)((qHead + 1) % Q_SIZE);    // move the head forward
     qCount--;                                   // one fewer waiting
   }
 }
 
 // Join the Wi-Fi network without ever blocking the loop. The ESP32 stack
-// connects in the background; we only kick off a (re)try every few seconds so
-// a slow/failed association can never freeze edge capture.
+// connects in the background, so this only kicks off a (re)try. Calling
+// begin() again while the stack is still associating ABORTS that attempt
+// ("sta is connecting, cannot set config"), which used to turn a normal 5 s join
+// into a one-minute one, so an association in flight is left alone.
 static uint32_t lastConnectAttemptMs = 0;
+static bool     wifiBegun = false;              // has begin() ever been called?
 static void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) return;    // already online
   const uint32_t now = millis();
-  if (now - lastConnectAttemptMs < 5000UL) return; // do not spam begin()
+  if (wifiBegun) {                              // only rate-limit real retries
+    if (now - lastConnectAttemptMs < 5000UL) return; // do not spam begin()
+    if (WiFi.status() == WL_IDLE_STATUS) return;     // still associating: hands off
+  }
   lastConnectAttemptMs = now;
+  wifiBegun = true;                             // first attempt done
   Serial.printf("[wifi] connecting to %s...\n", WIFI_SSID); // log the network name
   WiFi.mode(WIFI_STA);                          // station mode (client, not access point)
   WiFi.setAutoReconnect(true);                  // let the stack retry on its own
@@ -453,6 +466,7 @@ void setup() {
   syncTime();                                   // arm NTP (background, non-blocking)
 
   lastHeartbeatMs = millis();                   // first heartbeat is due one HEARTBEAT_MS from now
+  lastUploadOkMs  = millis();                   // grace period before the watchdog bites
   Serial.println("[SENSOR] warming up - give the sensor ~60 s to settle"); // SENSOR needs time
   Serial.println("[boot] done, watching GPIO14 (D14) by interrupt"); // ready
 }
@@ -575,6 +589,19 @@ void loop() {
     logWifiResult();                            // log the assigned IP
   } else if (!onlineNow) {
     wasOnline = false;                          // ready for the next transition
+  }
+
+  // Silence while the radio claims to be online means the request path is stuck
+  // (a dropped TLS session used to leave the board mute for minutes). Restarting
+  // costs at most the interval in progress and puts the dashboard back on truth.
+  // Signed on purpose: flushQueue() stamps lastUploadOkMs with a newer millis()
+  // than the `now` above, so an unsigned difference here would look enormous.
+  const int32_t silentMs = (int32_t)(millis() - lastUploadOkMs);
+  if (WiFi.status() == WL_CONNECTED && silentMs > (int32_t)WATCHDOG_MS) {
+    Serial.printf("[watchdog] no upload for %lus, heap %u - restarting\n",
+                  (unsigned long)(silentMs / 1000L), ESP.getFreeHeap());
+    delay(50);                                  // let the line flush
+    ESP.restart();                              // fresh radio, fresh TLS stack
   }
 
   // Stay awake on purpose: the CPU keeps the interrupt live for every edge, and
