@@ -5,3 +5,4 @@ node_modules/
 .pio/
 .vercel/
 .DS_Store
+serial.log
