@@ -1,6 +1,6 @@
 -- =====================================================================
 --  Motion logger schema  (Supabase project: motion-logger,
---  ref aodrehuwkyhujkjvwjwr)
+--  ref YOUR-PROJECT-REF)
 --  Already applied. Paste this ENTIRE file into Dashboard -> SQL Editor ->
 --  New query -> Run to rebuild it in another project. Idempotent.
 -- =====================================================================
@@ -234,7 +234,7 @@ end $$;
 -- 6. This device
 -- ---------------------------------------------------------------------
 insert into public.devices (name, device_key)
-values ('ESP32 WROOM - PIR hallway', 'dev_7c1e9a4b2d6f80e3a5c7b1d94e2f68ab')
+values ('ESP32 WROOM - PIR hallway', 'YOUR_DEVICE_KEY')
 on conflict (device_key) do nothing;
 
 -- ---------------------------------------------------------------------
