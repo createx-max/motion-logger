@@ -2,5 +2,7 @@ firmware/motion_logger/secrets.h
 .env
 .env.local
 node_modules/
+.pio/
 .vercel/
 .DS_Store
+serial.log

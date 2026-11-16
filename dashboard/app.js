@@ -11,8 +11,9 @@ const DAY = 86400000; // 24 * 60 * 60 * 1000
 // An interval that stays "open" for longer than this is treated as broken data.
 const STALE_OPEN_MS = 2 * HOUR;
 
-// The board pings every 30 s; after this much silence we call the device OFF.
-const ONLINE_MS = 60000; // 60 s: two missed 30 s heartbeats (or four missed 15 s ones) mean the board is gone
+// The board sends a presence heartbeat every 10 s; after this much silence we
+// call the device OFF, so pulling the plug shows up within half a minute.
+const ONLINE_MS = 30 * 1000; // 30 s: three missed 10 s heartbeats
 
 // How far back we pull rows from the database.
 const RANGE_DAYS = 30;
@@ -59,7 +60,7 @@ function startOfDay(t) {
 function ago(ms) {
   if (!ms) return 'never'; // no heartbeat at all yet
   const diff = Date.now() - ms; // how long ago it was
-  if (diff < 60000) return 'just now'; // under a minute
+  if (diff < 90000) return `${Math.max(1, Math.round(diff / 1000))} s ago`; // seconds, so a 30 s dropout reads right
   if (diff < HOUR) return `${Math.round(diff / 60000)} min ago`; // under an hour
   if (diff < DAY) return `${Math.round(diff / HOUR)} h ago`; // under a day
   return `${Math.round(diff / DAY)} d ago`; // days
@@ -74,6 +75,17 @@ function rowEnd(row, now) {
   const lastSeen = device?.last_seen_at ? new Date(device.last_seen_at).getTime() : 0; // heartbeat time
   const stopAt = lastSeen && now - lastSeen < ONLINE_MS ? now : lastSeen || now; // live only if the device is alive
   return Math.max(start + 1000, Math.min(stopAt, start + STALE_OPEN_MS)); // never negative, never absurdly long
+}
+
+// When the current detection began, in ms (0 = nothing running). An open row
+// wins because it carries the exact start; otherwise the device row's live
+// marker is used - the board PATCHes it on START and the database clears it the
+// moment the finished interval is stored, so the timer needs no RPC and no
+// open session row.
+function activeStartMs() {
+  const open = rows.find((r) => !r.ended_at); // interval still open (old firmware)
+  if (open) return new Date(open.started_at).getTime(); // exact start from the row
+  return device?.active_since ? new Date(device.active_since).getTime() : 0; // live marker
 }
 
 // Spread intervals across a list of time buckets ({start, end} pairs).
@@ -213,8 +225,6 @@ function render() {
   $('kpiLast').textContent = ago(lastAny); // "2 min ago"
 
   /* live state */
-  const open = rows.find((r) => !r.ended_at); // the one interval still open, if any
-  const openAge = open ? now - new Date(open.started_at).getTime() : 0; // how long it has been running
   const online = lastSeen && now - lastSeen < ONLINE_MS; // is the board alive?
   renderStatus(); // ON/OFF pill, tab title and alerts
 
@@ -343,10 +353,10 @@ async function toggleAlerts() {
 function renderStatus() {
   const now = Date.now(); // current time
   const lastSeen = device?.last_seen_at ? new Date(device.last_seen_at).getTime() : 0; // last heartbeat
-  const online = Boolean(lastSeen) && now - lastSeen < ONLINE_MS; // alive within the last 2 minutes?
-  const open = rows.find((r) => !r.ended_at); // the open interval, if any
-  const openAge = open ? now - new Date(open.started_at).getTime() : 0; // its age in ms
-  const detecting = open && openAge < STALE_OPEN_MS && online; // real detection = open + alive + not absurdly old
+  const online = Boolean(lastSeen) && now - lastSeen < ONLINE_MS; // alive within the last 30 s?
+  const activeStart = activeStartMs(); // when the current detection began, 0 if none
+  const openAge = activeStart ? now - activeStart : 0; // its age in ms
+  const detecting = Boolean(activeStart) && openAge < STALE_OPEN_MS && online; // live only while the board is alive
 
   /* tab title + alerts */
   const state = !online ? 'off' : detecting ? 'detecting' : 'idle'; // the three states
@@ -457,7 +467,7 @@ async function load() {
       .gte('started_at', since) // inside the window
       .order('started_at', { ascending: false }) // newest first
       .limit(2000), // safety cap
-    sb.from('device_status').select('id,name,last_seen_at').limit(1), // the single device row
+    sb.from('device_status').select('id,name,last_seen_at,active_since').limit(1), // device row + live marker
   ]);
 
   if (sessions.error) throw sessions.error; // surface read errors
@@ -466,6 +476,23 @@ async function load() {
 
   $('errorBanner').hidden = true; // hide any old error
   render(); // repaint
+}
+
+// The pill runs on a 30 s deadline, so it cannot wait for the 60 s safety
+// reload or trust realtime alone (a dropped WebSocket would make a live board
+// look dead). One device row every 10 s is cheap and keeps last_seen_at honest.
+async function refreshDevice() {
+  if (!sb) return; // nothing loaded yet
+  const { data, error } = await sb
+    .from('device_status') // the single device row
+    .select('id,name,last_seen_at,active_since') // heartbeat + live marker
+    .limit(1);
+  if (error || !data) return; // keep the last known state; load() reports failures
+  const next = data[0] || null; // the row, if the device is registered
+  const markerChanged = (next?.active_since || null) !== (device?.active_since || null); // started or stopped?
+  device = next; // freshest heartbeat/marker
+  if (markerChanged) return scheduleReload(); // a detection began or ended: refresh the tables
+  renderStatus(); // just repaint the pill
 }
 
 // Realtime fires a burst of events; collapse them into one reload.
@@ -616,6 +643,18 @@ async function start() {
 
   sb.channel('motion-logger')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'motion_sessions' }, scheduleReload) // live inserts
+    // The board pings every 10 s, so a full reload per beat would refetch the
+    // whole window for nothing. Realtime only tells us "the device row moved":
+    // copy the two live columns locally and repaint the pill, and fetch again
+    // only when a detection actually started or stopped.
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'devices' }, (payload) => {
+      const next = payload.new || {}; // the updated device row
+      if (!next.id) return; // deletes carry no row we can use
+      const markerChanged = (next.active_since || null) !== (device?.active_since || null); // started or stopped?
+      device = { ...(device || {}), ...next }; // keep last_seen_at and active_since fresh
+      if (markerChanged) scheduleReload(); // refresh the tables too
+      else render(); // heartbeat only: repaint, no network
+    })
     .subscribe((status) => {
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
         $('liveText').textContent = 'live updates offline — polling'; // realtime died, we still poll
@@ -624,6 +663,11 @@ async function start() {
 
   // cheap 1s tick: keeps the running timer alive without rebuilding the DOM
   setInterval(renderLive, 1000);
+
+  // keep the online pill within its 30 s deadline even without realtime
+  setInterval(() => {
+    refreshDevice().catch(() => {}); // network blips are handled by the next tick
+  }, 10000);
 
   // safety net: refresh from the database every minute even if realtime is quiet
   setInterval(() => {
