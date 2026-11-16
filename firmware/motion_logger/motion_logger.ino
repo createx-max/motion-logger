@@ -4,18 +4,42 @@
  * Wiring
  *   SENSOR  VCC  -> ESP32 VIN  (5 V, only valid while powered over USB)
  *   SENSOR  GND  -> ESP32 GND
- *   SENSOR  OUT  -> ESP32 GPIO14
+ *   SENSOR  OUT  -> ESP32 GPIO14 (D14)
  *   LED  +    -> SENSOR OUT    (through a 220-330 ohm resistor)
  *   LED  -    -> SENSOR GND
  *
  * What it does
- *   Reads the SENSOR output and turns every "light on" period into one row in
- *   Supabase, using the motion_event() database function:
+ *   Reads the SENSOR output, measures each "light on" period on the board and
+ *   sends it as ONE row to the standard motion_sessions table:
  *
- *     start -> inserts a row and stamps started_at
- *     stop  -> closes that row by stamping ended_at
- *     ping  -> heartbeat; refreshes devices.last_seen_at so the dashboard
- *              can tell ON from OFF
+ *     POST /rest/v1/motion_sessions
+ *     {"device_key":..,"started_at":..,"ended_at":..,"duration_s":..}
+ *
+ *   There is no RPC involved, so nothing has to be "programmed" first and a
+ *   missing function cannot turn logging into a 404. A trigger in schema.sql
+ *   swaps the device key for the device id, so the board never needs a UUID.
+ *
+ *     live     -> PATCH /rest/v1/devices?last_seen_at=not.is.null with
+ *                  {"last_seen_at":..,"active_since":..} the moment motion
+ *                  starts, so the dashboard can run a live stopwatch. No RPC,
+ *                  no open row: the marker lives in the device row.
+ *     heartbeat -> the same PATCH every 10 s, with active_since:null while
+ *                  nothing is running, which is how the dashboard tells ON from
+ *                  OFF within 30 s and how a stuck marker gets cleared.
+ *     stop     -> no request at all: the trigger that stores the finished
+ *                  interval clears active_since itself.
+ *
+ *   The signal is followed by a hardware interrupt, not by polling. That means
+ *   a short pulse that starts and ends between two loop passes is still logged,
+ *   and a blocking network call (Wi-Fi connect, NTP) can no longer swallow an
+ *   event: the edges are captured even while the loop is waiting.
+ *
+ *   Nothing in the loop blocks: Wi-Fi association and NTP run in the background,
+ *   so a slow router or a missing hotspot can never stall edge capture.
+ *
+ *   No CPU sleep: the loop stays awake, so the interrupt never misses an edge.
+ *   The power saving comes from the ESP32's own modem sleep - the radio dozes
+ *   between DTIM beacons while Wi-Fi stays associated, no reconnect penalty.
  *
  *   Events that cannot be delivered (no Wi-Fi, timeout, server error) wait in
  *   a small RAM queue and are retried, so a short outage does not lose data.
@@ -29,10 +53,10 @@
 #include <HTTPClient.h>       // simple POST helper on top of the TLS socket
 #include <time.h>             // time(), gmtime_r(), strftime() for UTC stamps
 
-#include "secrets.h"          // Wi-Fi name/password, Supabase URL + key, device key 
+#include "secrets.h"          // Wi-Fi name/password, Supabase URL + key, device key
 // ---------------------------------------------------------------- settings
 
-// GPIO wired to the  OUT pin.
+// GPIO wired to the  OUT pin (D14 on the ESP32 dev board).
 static const int      SENSOR_PIN        = 14;
 
 // Optional extra LED on a free GPIO; -1 means "not fitted".
@@ -44,22 +68,31 @@ static const uint32_t HOLD_MS      = 2000UL;
 // Safety valve: never let one session run longer than 30 minutes.
 static const uint32_t MAX_OPEN_MS  = 30UL * 60UL * 1000UL;
 
-// Heartbeat cadence; the dashboard treats 60 s of silence as device OFF,
-// so four missed pings inside a minute are enough to notice a power cut.
-static const uint32_t HEARTBEAT_MS = 15UL * 1000UL;
+// Presence cadence. A heartbeat is one tiny PATCH of a single column, and it is
+// only sent when no session went up inside the same window, so motion itself
+// keeps the device "seen". The dashboard treats 30 s of silence as OFF, so the
+// beat has to be well inside that: 10 s leaves room for one missed request.
+static const uint32_t HEARTBEAT_MS = 10UL * 1000UL;
 
 // How often a stuck queue is retried while offline.
 static const uint32_t RETRY_MS     = 15000UL;
 
 // ---------------------------------------------------------------- queue
 
-// How many unsent events we remember (oldest is dropped when full).
-static const uint8_t Q_SIZE = 24;
+// How many unsent items we remember (oldest is dropped when full).
+static const uint8_t Q_SIZE = 16;
 
-// One waiting event.
+// What a waiting item is: one finished interval, one presence heartbeat, or the
+// "detection started" marker that feeds the live stopwatch.
+enum : uint8_t { Q_SESSION = 0, Q_HEARTBEAT = 1, Q_LIVE = 2 };
+
+// One waiting item. A session carries its whole story - start, end and length -
+// so a single request can log it, even after a long outage.
 struct Pending {
-  char    event[6]; // "start", "stop" or "ping" (+ terminator)
-  time_t  ts;       // when it happened; 0 = let the server stamp it
+  uint8_t  kind;        // Q_SESSION, Q_HEARTBEAT or Q_LIVE
+  uint32_t durationS;   // measured on the board, never on the server
+  time_t   startedAt;   // session start (presence: when it was queued); 0 = no clock yet
+  time_t   activeSince; // presence only: live marker to assert, 0 = clear it
 };
 
 // The ring buffer itself plus its head index and item count.
@@ -75,7 +108,8 @@ static bool     sessionActive  = false;
 // millis() at which the current session started.
 static uint32_t sessionStartMs = 0;
 
-// millis() of the most recent HIGH reading (the true "light went off" moment).
+// millis() of the last moment the signal was known HIGH (the true "light went
+// off" moment once the signal has dropped).
 static uint32_t lastHighMs     = 0;
 
 // UTC timestamp of the session start; 0 when the clock was not synced yet.
@@ -90,15 +124,45 @@ static uint32_t lastRetryMs     = 0;
 // Set when something new is queued, so it is sent without waiting for RETRY_MS.
 static bool     flushRequested  = true;
 
+// True once the current association attempt has reported success (log once).
+static bool     wasOnline       = false;
+
+// ---------------------------------------------------------------- sensor interrupt
+
+// The pin is watched by an interrupt, so the loop only has to read these tiny
+// variables. Everything below is written inside the ISR and must stay volatile.
+static volatile bool     isrLevel   = false; // level the pin had at the last edge
+static volatile uint32_t isrEdgeMs  = 0;     // millis() of the last edge
+static volatile uint32_t isrRiseSeq = 0;     // how many rising edges so far
+static volatile uint32_t isrFallSeq = 0;     // how many falling edges so far
+
+// Rising/falling edges the loop has already turned into events.
+static uint32_t seenRiseSeq = 0;
+static uint32_t seenFallSeq = 0;
+
+// Runs on every edge of SENSOR_PIN. Kept as short as possible: capture the
+// time, remember the level, bump a counter. No Serial, no allocation, no I/O.
+static void IRAM_ATTR onSensorEdge() {
+  const uint32_t cap = millis();                    // stamp the edge first
+  if (digitalRead(SENSOR_PIN) == HIGH) {            // light / motion started
+    isrEdgeMs  = cap;                               // remember when it rose
+    isrLevel   = true;                              // current level
+    isrRiseSeq = isrRiseSeq + 1;                    // one more rising edge
+  } else {                                          // it stopped
+    isrEdgeMs  = cap;                               // remember when it fell
+    isrLevel   = false;                             // current level
+    isrFallSeq = isrFallSeq + 1;                    // one more falling edge
+  }
+}
+
 // ---------------------------------------------------------------- helpers
 
-// Convert a UTC timestamp into the ISO-8601 text Postgres accepts.
-static String isoUtc(time_t t) {
+// Format a UTC timestamp as the ISO-8601 text Postgres accepts, straight into a
+// caller-supplied buffer: no String, no heap allocation.
+static void isoUtcBuf(time_t t, char *out, size_t n) {
   struct tm tmUtc;                              // broken-down UTC time
   gmtime_r(&t, &tmUtc);                         // fill it from the timestamp
-  char buf[24];                                 // "2026-11-14T18:42:07Z" + terminator
-  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc); // format it
-  return String(buf);                           // hand back as String
+  strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", &tmUtc); // format it in place
 }
 
 // Current UTC time, or 0 while the clock is still unset (before 2023).
@@ -112,58 +176,199 @@ static void setStatusLed(bool on) {
   if (STATUS_LED_PIN >= 0) digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW); // ignore when not fitted
 }
 
-// Put one event at the back of the queue.
-static void enqueue(const char *event, time_t ts) {
-  if (qCount >= Q_SIZE) {                       // queue full?
-    qHead = (uint8_t)((qHead + 1) % Q_SIZE);    // drop the oldest event
-    qCount--;                                   // keep the count honest
+// Remove the oldest queued presence item, if there is one. Presence and the live
+// marker are disposable, a measured interval is not: this keeps the log intact
+// when the queue fills up.
+static bool dropOldestPresence() {
+  for (uint8_t i = 0; i < qCount; i++) {       // walk from the oldest item
+    const uint8_t at = (uint8_t)((qHead + i) % Q_SIZE);
+    if (queue[at].kind == Q_SESSION) continue;  // only presence items are expendable
+    for (uint8_t j = i; j + 1 < qCount; j++) {  // shift the rest one slot left
+      const uint8_t from = (uint8_t)((qHead + j + 1) % Q_SIZE);
+      const uint8_t to   = (uint8_t)((qHead + j) % Q_SIZE);
+      queue[to] = queue[from];
+    }
+    qCount--;                                   // one gone
+    return true;
   }
-  uint8_t slot = (uint8_t)((qHead + qCount) % Q_SIZE); // where the new one goes
-  strncpy(queue[slot].event, event, sizeof(queue[slot].event) - 1); // copy the name
-  queue[slot].event[sizeof(queue[slot].event) - 1] = '\0';         // always terminate
-  queue[slot].ts = ts;                          // remember when it happened
-  qCount++;                                     // one more waiting
-  flushRequested = true;                        // try to send it on this loop
-  Serial.printf("[queue] %-5s ts=%s (pending %u)\n", event,
-                ts ? isoUtc(ts).c_str() : "server", qCount); // log it
+  return false;                                 // nothing to give up
 }
 
-// POST one event to Supabase. Returns true only on a 2xx reply.
-static bool postEvent(const char *event, time_t ts) {
-  if (WiFi.status() != WL_CONNECTED) return false; // no network, nothing to try
+// Put one item at the back of the queue.
+static void enqueue(const Pending &item) {
+  if (qCount >= Q_SIZE) {                       // queue full?
+    if (item.kind == Q_SESSION) dropOldestPresence(); // free a presence slot first
+    if (qCount >= Q_SIZE) {                     // still full: drop the oldest item
+      qHead = (uint8_t)((qHead + 1) % Q_SIZE);
+      qCount--;
+    }
+  }
+  queue[(uint8_t)((qHead + qCount) % Q_SIZE)] = item; // store a copy
+  qCount++;                                     // one more waiting
+  flushRequested = true;                        // try to send it on this loop
+  if (item.kind == Q_SESSION) {                 // one finished interval
+    char when[24];                              // formatted start, or a note
+    if (item.startedAt) isoUtcBuf(item.startedAt, when, sizeof(when));
+    else                snprintf(when, sizeof(when), "clock unsynced");
+    Serial.printf("[queue] session %lu s from %s (pending %u)\n",
+                  (unsigned long)item.durationS, when, qCount);
+  } else if (item.kind == Q_LIVE) {             // detection just started
+    Serial.printf("[queue] live start (pending %u)\n", qCount);
+  } else {                                      // presence heartbeat
+    Serial.printf("[queue] heartbeat (pending %u)\n", qCount);
+  }
+}
 
-  WiFiClientSecure client;                      // TLS socket for this request
+// Queue one measured interval. startedAt = 0 means the clock was not synced
+// when the light came on; postSession() then places it relative to "now".
+static void enqueueSession(time_t startedAt, uint32_t durationS) {
+  Pending p;                                   // build it on the stack
+  p.kind      = Q_SESSION;
+  p.durationS = durationS;
+  p.startedAt = startedAt;
+  enqueue(p);
+}
+
+// Queue one presence PATCH. activeSince = 0 means "nothing is running", which
+// travels as active_since:null; a real timestamp marks an ongoing detection.
+static void enqueuePresence(time_t ts, time_t activeSince) {
+  Pending p;
+  p.kind        = activeSince ? Q_LIVE : Q_HEARTBEAT;
+  p.durationS   = 0;
+  p.startedAt   = ts;
+  p.activeSince = activeSince;
+  enqueue(p);
+}
+
+// Open a TLS request with the Supabase headers already on it. The caller owns
+// both objects on its own stack, so nothing outlives the call. Returns false
+// only when nothing was opened, i.e. when there is no socket to close.
+static bool beginRequest(WiFiClientSecure &client, HTTPClient &http,
+                         const char *url, const char *auth) {
   client.setInsecure();                         // no CA bundle on the device; traffic is still encrypted
-
-  HTTPClient http;                              // request object
   http.setConnectTimeout(6000);                 // give up connecting after 6 s
   http.setTimeout(8000);                        // and after 8 s of no answer
-
-  String url = String(SUPABASE_URL) + "/rest/v1/rpc/motion_event"; // the database function
   if (!http.begin(client, url)) {               // open the connection
     Serial.println("[http] begin() failed");    // bad URL or out of memory
-    return false;
+    return false;                               // nothing is open yet
   }
-  http.addHeader("apikey", SUPABASE_ANON_KEY);                          // Supabase key header
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY); // and the bearer header
-  http.addHeader("Content-Type", "application/json");                  // we send JSON
+  http.addHeader("apikey", SUPABASE_ANON_KEY);                      // Supabase key header
+  http.addHeader("Authorization", auth);                            // and the bearer header
+  http.addHeader("Content-Type", "application/json");              // we send JSON
+  http.addHeader("Prefer", "return=minimal");                       // no reply body needed
+  return true;
+}
 
-  String body = String("{\"p_device_key\":\"") + DEVICE_KEY +          // which device
-                "\",\"p_event\":\"" + event + "\",\"p_ts\":";          // which event, then the time
-  body += ts ? ("\"" + isoUtc(ts) + "\"") : String("null");            // real timestamp or null
-  body += "}";                                                         // close the JSON
+// POST one finished interval to the standard motion_sessions table. ONE request
+// per interval: start, end and length travel together, so the server only stores
+// the row - nothing to stitch, no follow-up call, no RPC to exist.
+static bool postSession(time_t startedAt, uint32_t durationS) {
+  if (WiFi.status() != WL_CONNECTED) return false; // no network, nothing to try
 
-  int code = http.POST(body);                   // send it
+  // Timestamps first: a row without a real clock is useless, so it stays queued
+  // until NTP lands (normally a second after boot).
+  const time_t nowTs = nowUnix();
+  time_t end   = startedAt ? startedAt + (time_t)durationS : nowTs;
+  time_t start = startedAt ? startedAt : (end ? end - (time_t)durationS : 0);
+  if (!start || !end) return false;             // clock still unset: retry later
+
+  // Everything that can fail is built BEFORE a socket is opened, so no early
+  // return can leave a TLS connection dangling.
+  char url[96];                                 // stack buffer: no String churn
+  snprintf(url, sizeof(url), "%s/rest/v1/motion_sessions", SUPABASE_URL);
+
+  char auth[96];                                // "Bearer <key>" once, on the stack
+  snprintf(auth, sizeof(auth), "Bearer %s", SUPABASE_ANON_KEY);
+
+  char sStart[24], sEnd[24];                    // "2026-11-14T18:42:07Z"
+  isoUtcBuf(start, sStart, sizeof(sStart));
+  isoUtcBuf(end,   sEnd,   sizeof(sEnd));
+
+  // Build the JSON straight into a stack buffer. Repeated String concatenation
+  // is what fragments the heap on small boards (the D1 Mini port would die).
+  char json[224];
+  int len = snprintf(json, sizeof(json),
+                     "{\"device_key\":\"%s\",\"started_at\":\"%s\",\"ended_at\":\"%s\",\"duration_s\":%lu}",
+                     DEVICE_KEY, sStart, sEnd, (unsigned long)durationS);
+  if (len <= 0) return false;                   // formatting failed: keep the row
+  if (len >= (int)sizeof(json)) len = (int)sizeof(json) - 1; // never over-read
+
+  WiFiClientSecure client;                      // TLS socket for this request
+  HTTPClient http;
+  if (!beginRequest(client, http, url, auth)) return false;
+
+  int code = http.POST((uint8_t *)json, (size_t)len); // send the buffer as-is
   bool ok  = (code >= 200 && code < 300);       // 2xx means stored
 
   if (!ok) {                                    // explain the failure on serial
     String reply = http.getString();            // server's message
     if (reply.length() > 160) reply = reply.substring(0, 160); // keep it short
-    Serial.printf("[http] %s -> %d %s\n", event, code, reply.c_str()); // log it
-    if (code == 401 || code == 404) {           // auth or missing function
-      Serial.println("[http] check SUPABASE_ANON_KEY and the motion_event() function");
-    } else if (code >= 400 && reply.indexOf("unknown device key") >= 0) {
+    Serial.printf("[http] session %lus -> %d %s\n",
+                  (unsigned long)durationS, code, reply.c_str());
+    if (code == 401 || code == 403) {           // key or insert policy
+      Serial.println("[http] check SUPABASE_ANON_KEY and the motion_sessions insert policy");
+    } else if (code == 404) {                   // table not created yet
+      Serial.println("[http] run supabase/schema.sql in the Supabase SQL editor");
+    } else if (reply.indexOf("unknown device key") >= 0) {
       Serial.println("[http] check DEVICE_KEY"); // wrong device key in secrets.h
+    }
+  }
+  http.end();                                   // close the connection
+  return ok;                                    // tell the caller
+}
+
+// Presence and live state in ONE PATCH of the device row:
+//   idle  -> {"last_seen_at":"...","active_since":null}   nothing running
+//   start -> {"last_seen_at":"...","active_since":"..."}  detection began
+// A start costs one PATCH, a stop costs none at all (the ingest trigger clears
+// active_since when the finished interval lands), so one motion = one row + one
+// tiny PATCH. A quiet night costs a handful of requests per hour.
+// The filter is mandatory: PostgREST rejects an UPDATE without a WHERE clause
+// (21000 "UPDATE requires a WHERE clause") and updates nothing. "not null" needs
+// no device id - the project has one device row - and Postgres only lets the
+// filtered UPDATE see rows that pass a SELECT policy, which schema.sql provides.
+static bool postPresence(time_t ts, time_t activeSince) {
+  if (WiFi.status() != WL_CONNECTED) return false; // no network, nothing to try
+
+  const time_t when = ts ? ts : nowUnix();      // when it happened
+  if (!when) return false;                      // clock still unset
+
+  char url[96];
+  snprintf(url, sizeof(url), "%s/rest/v1/devices?last_seen_at=not.is.null",
+           SUPABASE_URL);
+
+  char auth[96];
+  snprintf(auth, sizeof(auth), "Bearer %s", SUPABASE_ANON_KEY);
+
+  char iso[24], live[24];
+  isoUtcBuf(when, iso, sizeof(iso));
+  if (activeSince) isoUtcBuf(activeSince, live, sizeof(live));
+
+  // 72 bytes at most, so a 96 byte buffer never clips it
+  char json[96];
+  int len = activeSince
+    ? snprintf(json, sizeof(json),
+               "{\"last_seen_at\":\"%s\",\"active_since\":\"%s\"}", iso, live)
+    : snprintf(json, sizeof(json),
+               "{\"last_seen_at\":\"%s\",\"active_since\":null}", iso);
+  if (len <= 0) return false;
+  if (len >= (int)sizeof(json)) len = (int)sizeof(json) - 1;
+
+  WiFiClientSecure client;                      // TLS socket for this request
+  HTTPClient http;
+  if (!beginRequest(client, http, url, auth)) return false;
+
+  int code = http.PATCH((uint8_t *)json, (size_t)len); // update just that column
+  bool ok  = (code >= 200 && code < 300);       // 204 is the normal answer
+
+  if (!ok) {
+    String reply = http.getString();
+    if (reply.length() > 160) reply = reply.substring(0, 160);
+    Serial.printf("[http] presence -> %d %s\n", code, reply.c_str());
+    if (code == 401 || code == 403) {
+      Serial.println("[http] presence needs the devices update grant (schema.sql)");
+    } else if (reply.indexOf("active_since") >= 0) {
+      Serial.println("[http] active_since missing: re-run supabase/schema.sql");
     }
   }
   http.end();                                   // close the connection
@@ -174,42 +379,55 @@ static bool postEvent(const char *event, time_t ts) {
 static void flushQueue() {
   while (qCount > 0) {                          // as long as something is pending
     Pending &p = queue[qHead];                  // oldest item
-    if (!postEvent(p.event, p.ts)) return;      // failed: keep it, retry later
-    Serial.printf("[sync] %s ok\n", p.event);   // delivered
+    const bool session = (p.kind == Q_SESSION); // interval or heartbeat?
+    const bool sent = session ? postSession(p.startedAt, p.durationS)
+                              : postPresence(p.startedAt, p.activeSince);
+    if (!sent) return;                          // failed: keep it, retry later
+    if (session) {
+      Serial.printf("[sync] session %lu s ok\n", (unsigned long)p.durationS);
+    } else if (p.kind == Q_LIVE) {
+      Serial.println("[sync] live start ok");   // dashboard can start its timer
+    } else {
+      Serial.println("[sync] heartbeat ok");
+    }
+    lastHeartbeatMs = millis();                 // every upload already proves presence
     qHead = (uint8_t)((qHead + 1) % Q_SIZE);    // move the head forward
     qCount--;                                   // one fewer waiting
   }
 }
 
-// Join the Wi-Fi network, waiting up to 20 s.
+// Join the Wi-Fi network without ever blocking the loop. The ESP32 stack
+// connects in the background; we only kick off a (re)try every few seconds so
+// a slow/failed association can never freeze edge capture.
+static uint32_t lastConnectAttemptMs = 0;
 static void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) return;    // already online
-  Serial.printf("[wifi] connecting to %s", WIFI_SSID); // log the network name
+  const uint32_t now = millis();
+  if (now - lastConnectAttemptMs < 5000UL) return; // do not spam begin()
+  lastConnectAttemptMs = now;
+  Serial.printf("[wifi] connecting to %s...\n", WIFI_SSID); // log the network name
   WiFi.mode(WIFI_STA);                          // station mode (client, not access point)
   WiFi.setAutoReconnect(true);                  // let the stack retry on its own
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);         // start connecting
-
-  uint32_t start = millis();                    // timeout reference
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000UL) { // wait up to 20 s
-    delay(400);                                 // do not spin the CPU
-    Serial.print('.');                          // progress dots
-  }
-  Serial.println(WiFi.status() == WL_CONNECTED
-                   ? " ok " + WiFi.localIP().toString()  // show the assigned IP
-                   : " failed (will retry)");            // or admit failure
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);         // start connecting (non-blocking)
 }
 
-// Sync the clock over NTP; the timestamps depend on it.
+// Report the (non-blocking) association result when it lands.
+static void logWifiResult() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[wifi] ok %s\n", WiFi.localIP().toString().c_str());
+  }
+}
+
+// Sync the clock over NTP without blocking. configTime() only arms the client;
+// the real sync happens in the background and nowUnix() flips once it lands.
+static bool ntpStarted = false;
 static void syncTime() {
   if (nowUnix() > 0) return;                    // already have a sane time
-  configTime(0, 0, "pool.ntp.org", "time.google.com"); // UTC, two public servers
-  Serial.print("[ntp] syncing");                // progress note
-  uint32_t start = millis();                    // timeout reference
-  while (nowUnix() == 0 && millis() - start < 15000UL) { // wait up to 15 s
-    delay(400);                                 // breathe
-    Serial.print('.');                          // progress dots
+  if (!ntpStarted) {
+    ntpStarted = true;
+    configTime(0, 0, "pool.ntp.org", "time.google.com"); // UTC, two public servers
+    Serial.println("[ntp] syncing (background)..."); // progress note
   }
-  Serial.println(nowUnix() ? " ok" : " failed (server will stamp times)"); // result
 }
 
 // ---------------------------------------------------------------- setup
@@ -221,16 +439,22 @@ void setup() {
   Serial.println();                             // blank line
   Serial.println("=== motion logger booting ==="); // banner
 
-  pinMode(SENSOR_PIN, INPUT);                      // SENSOR OUT is an input to us
+  pinMode(SENSOR_PIN, INPUT);                   // SENSOR OUT is an input to us
   if (STATUS_LED_PIN >= 0) pinMode(STATUS_LED_PIN, OUTPUT); // optional LED is an output
   setStatusLed(false);                          // start with the LED off
 
-  connectWifi();                                // join the network first
-  syncTime();                                   // then set the clock
+  // Watch the pin from now on, so pulses during the Wi-Fi/NTP wait are kept.
+  isrLevel = (digitalRead(SENSOR_PIN) == HIGH); // level at boot
+  isrEdgeMs = millis();                         // "started" now
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onSensorEdge, CHANGE);
 
-  lastHeartbeatMs = millis();                   // first heartbeat is due 30 s from now
+  connectWifi();                                // start joining (background, non-blocking)
+  WiFi.setSleep(true);                          // modem sleep: radio off between beacons
+  syncTime();                                   // arm NTP (background, non-blocking)
+
+  lastHeartbeatMs = millis();                   // first heartbeat is due one HEARTBEAT_MS from now
   Serial.println("[SENSOR] warming up - give the sensor ~60 s to settle"); // SENSOR needs time
-  Serial.println("[boot] done, watching GPIO14"); // ready
+  Serial.println("[boot] done, watching GPIO14 (D14) by interrupt"); // ready
 }
 
 // ---------------------------------------------------------------- loop
@@ -238,32 +462,62 @@ void setup() {
 // Runs forever, several times per second.
 void loop() {
   const uint32_t now = millis();                // current uptime in ms
-  const int      SENSOR = digitalRead(SENSOR_PIN);    // HIGH = motion, LED lit
 
-  if (!sessionActive) {
-    if (SENSOR == HIGH) {                          // motion started
+  // Read the interrupt state once, with interrupts briefly off so a change
+  // cannot tear the snapshot.
+  noInterrupts();
+  const bool     level   = isrLevel;            // HIGH = motion, LED lit
+  const uint32_t edgeMs  = isrEdgeMs;           // when the last edge happened
+  const uint32_t riseSeq = isrRiseSeq;          // rising edges so far
+  const uint32_t fallSeq = isrFallSeq;          // falling edges so far
+  interrupts();
+
+  // A rising edge the loop has not handled yet opens (or refreshes) a session.
+  if (riseSeq != seenRiseSeq) {
+    seenRiseSeq = riseSeq;                      // handled in this pass
+    lastHighMs  = edgeMs;                       // last confirmed HIGH
+    if (!sessionActive) {                       // a new pulse, not a bounce
       sessionActive  = true;                    // open a session
-      sessionStartMs = now;                     // remember when
-      lastHighMs     = now;                     // last confirmed HIGH
+      sessionStartMs = edgeMs;                  // when the pin actually rose
       sessionStartTs = nowUnix();               // real clock time, 0 if not synced
       setStatusLed(true);                       // mirror the state on the LED
       Serial.println("[motion] START");         // log it
-      enqueue("start", sessionStartTs);         // tell the server
+      // One tiny PATCH puts the live marker in the device row; the dashboard
+      // reads it straight away. Without a clock there is nothing valid to send.
+      if (sessionStartTs) enqueuePresence(sessionStartTs, sessionStartTs);
+      else Serial.println("[live] clock not synced yet - no start marker");
     }
-  } else {
-    if (SENSOR == HIGH) lastHighMs = now;          // still detecting: keep the end time fresh
+  } else if (!sessionActive && level) {
+    // Board booted while the signal was already HIGH: no edge will follow.
+    sessionActive  = true;
+    sessionStartMs = now;
+    lastHighMs     = now;
+    sessionStartTs = nowUnix();
+    setStatusLed(true);
+    Serial.println("[motion] START (already high at boot)");
+    if (sessionStartTs) enqueuePresence(sessionStartTs, sessionStartTs); // live marker
+  }
+
+  // A falling edge stamps the exact moment the signal dropped. This is the
+  // "light went off" time, so the row does not end when the loop noticed.
+  if (fallSeq != seenFallSeq) {
+    seenFallSeq = fallSeq;                      // handled in this pass
+    if (edgeMs > lastHighMs) lastHighMs = edgeMs; // exact end of the HIGH period
+  }
+
+  if (sessionActive) {
+    if (level == HIGH) lastHighMs = now;        // still detecting: keep the end time fresh
 
     const uint32_t held  = now - lastHighMs;    // time since the last HIGH
     const uint32_t total = now - sessionStartMs; // how long this session has run
 
     if (held > HOLD_MS || total > MAX_OPEN_MS) { // long enough LOW, or hit the 30 min cap
-      // the light went off when the signal last dropped, not now
-      time_t endTs = sessionStartTs ? sessionStartTs + (time_t)((lastHighMs - sessionStartMs) / 1000UL)
-                                    : 0;        // exact end = start + time held HIGH
-      if (sessionStartTs && endTs <= sessionStartTs) endTs = sessionStartTs + 1; // never zero-length
+      // The length is measured here, on the board: one request will carry it.
+      uint32_t durS = (lastHighMs - sessionStartMs) / 1000UL; // whole seconds
+      if (durS == 0) durS = 1;                  // a logged interval is never empty
 
-      Serial.printf("[motion] STOP after %lu s\n", (unsigned long)(total / 1000UL)); // log the length
-      enqueue("stop", endTs);                   // close the row on the server
+      Serial.printf("[motion] STOP after %lu s\n", (unsigned long)durS); // log the length
+      enqueueSession(sessionStartTs, durS);     // one row, sent in one request
 
       sessionActive  = false;                   // ready for the next motion
       sessionStartTs = 0;                       // clear the start stamp
@@ -271,21 +525,60 @@ void loop() {
     }
   }
 
-  if (now - lastHeartbeatMs >= HEARTBEAT_MS) {  // heartbeat due?
+  // The clock can land while a session is already running (Wi-Fi associates
+  // first, NTP answers a moment later). Fill the start stamp in and publish the
+  // live marker then, so the dashboard still gets its stopwatch.
+  if (sessionActive && !sessionStartTs) {
+    const time_t nowTs = nowUnix();
+    if (nowTs) {
+      sessionStartTs = nowTs - (time_t)((now - sessionStartMs) / 1000UL);
+      enqueuePresence(nowTs, sessionStartTs);
+      Serial.println("[live] clock synced mid-session - start marker sent");
+    }
+  }
+
+  if (now - lastHeartbeatMs >= HEARTBEAT_MS) {  // presence due?
     lastHeartbeatMs = now;                      // reset the timer
-    enqueue("ping", 0);                         // server stamps the time itself
+    // While a session is running the beat re-asserts the live marker, so a long
+    // detection is never wiped by an idle heartbeat; otherwise it sends null.
+    const time_t nowTs = nowUnix();
+    time_t since = 0;
+    if (sessionActive && nowTs) {
+      since = sessionStartTs ? sessionStartTs
+                             : nowTs - (time_t)((now - sessionStartMs) / 1000UL);
+    }
+    enqueuePresence(nowTs, since);              // one tiny PATCH
   }
 
   // Send new events straight away; retry pending ones every RETRY_MS.
   if (qCount > 0 && (flushRequested || now - lastRetryMs >= RETRY_MS)) {
     flushRequested = false;                     // handled in this pass
     lastRetryMs    = now;                       // reset the retry timer
-    if (WiFi.status() != WL_CONNECTED) connectWifi(); // try to get back online
+    if (WiFi.status() != WL_CONNECTED) connectWifi(); // kick a background connect
     if (WiFi.status() == WL_CONNECTED) {        // only when online
-      syncTime();                               // make sure the clock is right
+      syncTime();                               // arm the clock (background)
       flushQueue();                             // push everything waiting
     }
   }
 
-  delay(50);                                    // small pause, keeps the loop cheap
+  // Say once that the background clock sync landed (timestamps are real now).
+  static bool ntpReported = false;
+  if (!ntpReported && nowUnix() > 0) {
+    ntpReported = true;
+    Serial.println("[ntp] ok (background)");
+  }
+
+  // Report the first successful association after a (re)connect attempt.
+  const bool onlineNow = (WiFi.status() == WL_CONNECTED);
+  if (onlineNow && !wasOnline) {                // just came online
+    wasOnline = true;                           // remember it
+    logWifiResult();                            // log the assigned IP
+  } else if (!onlineNow) {
+    wasOnline = false;                          // ready for the next transition
+  }
+
+  // Stay awake on purpose: the CPU keeps the interrupt live for every edge, and
+  // the idle time in this delay() lets the ESP32's modem sleep doze the radio
+  // between DTIM beacons while the Wi-Fi association stays intact.
+  delay(20);                                    // edges are safe in the ISR
 }

@@ -62,8 +62,9 @@ What [`supabase/schema.sql`](supabase/schema.sql) created (re-running it is safe
      from the browser);
    - `motion_sessions` — one row per light-on interval (`started_at`,
      `ended_at`, derived `duration_s`);
-   - `motion_event()` — the only write path; it validates the device key and
-     closes any interval left open by a reboot;
+   - `motion_sessions_ingest` — a `before insert` trigger: it turns the device
+     key in the insert body into `device_id` and clears it, so the board writes
+     straight into the table. **No RPC has to be created** for logging to work;
 - `device_status` / `motion_daily` — read-only views for the dashboard;
 - RLS + realtime publication;
 - your board: `ESP32 WROOM - PIR hallway`, key
@@ -107,23 +108,42 @@ in `dashboard/config.js` and `firmware/motion_logger/secrets.h`. Never put the
    [ntp] syncing. ok
    [boot] done, watching GPIO14
    [motion] START
-   [queue] start ts=2026-11-14T15:32:07Z (pending 1)
-   [sync] start ok
    ...
    [motion] STOP after 30 s
-   [sync] stop ok
+   [queue] session 30 s from 2026-11-14T15:32:07Z (pending 1)
+   [sync] session 30 s ok
+   [queue] heartbeat (pending 1)
+   [sync] heartbeat ok
    ```
 
 How the sketch behaves:
 
 - **start** on the rising edge, **stop** on the falling edge (after 2 s of
   continuous LOW, so the PIR's own 30 s hold is not split).
-- **ping** every 5 min so the dashboard can tell "idle" from "device offline".
-- Failed requests are queued in RAM (24 events) and retried every 15 s; a new
-  event is sent immediately.
-- A session left open by a power cut is closed automatically by the next
-  `start`.
-- Times are UTC from NTP; if the clock is not synced yet the server stamps them.
+- **one request per interval**: the board measures the length itself and the
+  interval is sent once it ends, as a single row
+  (`POST /rest/v1/motion_sessions`) with `started_at`, `ended_at` and
+  `duration_s`. Nothing is stitched together on the server, no TLS socket is
+  held open between events, and one motion = one write.
+- **live marker on start**: the moment motion begins the board sends one tiny
+  `PATCH /rest/v1/devices?last_seen_at=not.is.null` with
+  `{"last_seen_at":..,"active_since":..}`. The dashboard reads
+  `device_status.active_since` and runs the live stopwatch from it, so there is
+  no open row and no RPC involved.
+- **stop costs nothing**: the trigger that stores the finished interval clears
+  `active_since` in the same statement, so the board never sends a stop request.
+- **heartbeat** every 10 s (same PATCH, `active_since: null` while nothing is
+  running) so the dashboard can tell idle from offline: 30 s of silence means
+  the board lost power, and the pill flips to OFF on the next 1 s tick. Pulling
+  the plug also leaves no marker behind for long. The filter is required:
+  PostgREST refuses an UPDATE without a WHERE clause (21000) and Postgres only
+  lets a filtered UPDATE see rows that pass a SELECT policy, both of which
+  `schema.sql` accounts for.
+- Failed requests are queued in RAM (16 items) and retried every 15 s; a new
+  item is sent immediately. A full queue drops heartbeats before it ever drops
+  a measured interval.
+- Times are UTC from NTP; if the clock is not synced yet the interval waits in
+  the queue until it is, instead of being written with a wrong time.
 
 ---
 
@@ -178,22 +198,28 @@ select * from motion_daily order by day desc limit 14;
 
 | Symptom | Cause / fix |
 | --- | --- |
-| `[http] start -> 401` | Wrong `SUPABASE_ANON_KEY`, or you pasted the **secret** key. |
-| `[http] start -> 404` | `motion_event()` missing — re-run `schema.sql` in the right project. |
+| `[http] session .. -> 401/403` | Wrong `SUPABASE_ANON_KEY`, or the insert policy is missing — re-run `schema.sql`. |
+| `[http] session .. -> 404` | `motion_sessions` missing — run `schema.sql` in the right project. |
+| `Could not find the 'device_key' column` | Old schema: re-run `schema.sql` (it adds the ingest column + trigger). |
 | `unknown device key` in the serial log | `DEVICE_KEY` in `secrets.h` ≠ the row in `devices`. |
 | Dashboard says `Could not read from Supabase` | Wrong URL/key, or the RLS policy was not created. |
-| Dashboard connected but no rows | Sketch never reached `[sync] start ok`; check the serial log. |
-| Live pill says "device offline" | No ping for 15 min: board unplugged, Wi-Fi down, or PIR on a 5 GHz SSID. |
+| Dashboard connected but no rows | Sketch never reached `[sync] session .. ok`; check the serial log. |
+| Live pill says "device offline" | No heartbeat for 30 s: board unplugged, Wi-Fi down, or PIR on a 5 GHz SSID. |
+| Live timer never starts | `[sync] live start ok` missing in the serial log: the `active_since` column or the devices PATCH is missing — re-run `schema.sql`. |
+| Live timer keeps running with no motion | Stale marker after a power cut; the next heartbeat (10 s) clears it, or run the SQL below. |
+| `[http] heartbeat -> 400` `21000` | Old schema/patch without a filter: re-run `schema.sql` and re-flash the sketch. |
+| `permission denied for table devices` on a direct read | Expected: `devices` is column-granted and `device_key` is never readable; use the `device_status` view. |
 | Interval stuck as "stale" | Board lost power mid-session; it closes itself on the next `start` (or see the SQL below). |
 | Upload: `Failed to connect` | Hold **BOOT**, or lower upload speed to 115200. |
 | Garbage in Serial Monitor | Wrong port or wrong baud (115200). |
 
-Manually close a stuck interval:
+Manually close a stuck interval, or drop a stale live marker:
 
 ```sql
 update motion_sessions set ended_at = now() where ended_at is null;
+update devices set active_since = null where active_since is not null;
 ```
 
-The dashboard is read-only by design: writes only happen through
-`motion_event()`, so the publishable key in a browser can never forge or edit
-sessions.
+The dashboard is read-only by design: `motion_sessions` accepts inserts (guarded
+by the device key in a trigger) and has no update or delete policy, so the
+publishable key in a browser can never edit or erase stored sessions.
