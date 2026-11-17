@@ -480,11 +480,24 @@ void loop() {
   // Read the interrupt state once, with interrupts briefly off so a change
   // cannot tear the snapshot.
   noInterrupts();
-  const bool     level   = isrLevel;            // HIGH = motion, LED lit
+  const bool     isrLvl  = isrLevel;            // cached level from the ISR
   const uint32_t edgeMs  = isrEdgeMs;           // when the last edge happened
   const uint32_t riseSeq = isrRiseSeq;          // rising edges so far
   const uint32_t fallSeq = isrFallSeq;          // falling edges so far
   interrupts();
+
+  // The pin is the authority. One missed edge (an HTTP call, the snapshots above
+  // that run with interrupts off) could leave the cached level stuck on HIGH for
+  // ever, and then the session never closed, so nothing was ever written to the
+  // table. Reading the pin every pass makes that impossible.
+  const bool level = (digitalRead(SENSOR_PIN) == HIGH); // HIGH = motion, LED lit
+  if (level != isrLvl) {                        // cached copy drifted: resync it
+    noInterrupts();                             // do not race a fresh edge
+    isrLevel = level;                           // ISR now agrees with the pin
+    interrupts();
+    Serial.printf("[sensor] level resynced to %s\n", level ? "HIGH" : "LOW");
+  }
+
 
   // A rising edge the loop has not handled yet opens (or refreshes) a session.
   if (riseSeq != seenRiseSeq) {
@@ -562,6 +575,7 @@ void loop() {
                              : nowTs - (time_t)((now - sessionStartMs) / 1000UL);
     }
     enqueuePresence(nowTs, since);              // one tiny PATCH
+    Serial.printf("[hb] pin=%s session=%d\n", level ? "HIGH" : "LOW", sessionActive ? 1 : 0); // ground truth on serial
   }
 
   // Send new events straight away; retry pending ones every RETRY_MS.
