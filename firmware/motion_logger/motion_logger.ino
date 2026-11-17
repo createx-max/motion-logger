@@ -100,6 +100,48 @@ static Pending  queue[Q_SIZE];
 static uint8_t  qHead  = 0; // index of the oldest item
 static uint8_t  qCount = 0; // how many items are waiting
 
+// ---------------------------------------------------------------- littlefs (OPTIONAL, commented out)
+// The queue below lives in RAM, so a power cut loses whatever was not sent yet.
+// Uncommenting this block (plus the two LittleFS lines in platformio.ini) makes
+// the queue survive a restart: every change is written to flash, and setup()
+// loads it back before the first request goes out. It is commented out on
+// purpose - the default build stays small and never touches the flash.
+//
+// #include <LittleFS.h>
+//
+// static const char *QUEUE_FILE = "/queue.bin"; // one small binary blob
+// static bool fsReady = false;                  // mounted and usable
+//
+// // Mount the filesystem (format on first use) and restore what was waiting.
+// static void fsBegin() {
+//   fsReady = LittleFS.begin(true);             // true = format when unformatted
+//   if (!fsReady) { Serial.println("[fs] mount failed"); return; }
+//   File f = LittleFS.open(QUEUE_FILE, "r");    // may not exist yet
+//   if (!f) { Serial.println("[fs] nothing to restore"); return; }
+//   uint8_t count = 0;
+//   if (f.read(&count, 1) == 1 && count <= Q_SIZE &&
+//       f.read((uint8_t *)queue, sizeof(Pending) * count) == sizeof(Pending) * count) {
+//     qHead  = 0;                               // restored compacted
+//     qCount = count;
+//     Serial.printf("[fs] restored %u item(s)\n", qCount);
+//   }
+//   f.close();
+// }
+//
+// // Rewrite the queue in flash, oldest first. 16 tiny structs, so a save costs
+// // a few milliseconds and happens only when the queue actually changed.
+// static void fsSave() {
+//   if (!fsReady) return;
+//   File f = LittleFS.open(QUEUE_FILE, "w");
+//   if (!f) return;
+//   f.write(&qCount, 1);                        // how many follow
+//   for (uint8_t i = 0; i < qCount; i++) {      // in delivery order
+//     const uint8_t at = (uint8_t)((qHead + i) % Q_SIZE);
+//     f.write((const uint8_t *)&queue[at], sizeof(Pending));
+//   }
+//   f.close();
+// }
+
 // ---------------------------------------------------------------- state
 
 // True while the SENSOR output is being logged as one open session.
@@ -222,6 +264,8 @@ static void enqueue(const Pending &item) {
   } else {                                      // presence heartbeat
     Serial.printf("[queue] heartbeat (pending %u)\n", qCount);
   }
+
+  // fsSave(); // a new item has to survive a power cut
 }
 
 // Queue one measured interval. startedAt = 0 means the clock was not synced
@@ -399,6 +443,8 @@ static void flushQueue() {
     lastUploadOkMs  = millis();                 // the link is alive, so the watchdog stays quiet
     qHead = (uint8_t)((qHead + 1) % Q_SIZE);    // move the head forward
     qCount--;                                   // one fewer waiting
+
+    // fsSave(); // the delivered item is gone from flash too
   }
 }
 
@@ -460,6 +506,8 @@ void setup() {
   isrLevel = (digitalRead(SENSOR_PIN) == HIGH); // level at boot
   isrEdgeMs = millis();                         // "started" now
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onSensorEdge, CHANGE);
+
+  // fsBegin();                                  // restore the queue from flash (LittleFS, optional)
 
   connectWifi();                                // start joining (background, non-blocking)
   WiFi.setSleep(true);                          // modem sleep: radio off between beacons
